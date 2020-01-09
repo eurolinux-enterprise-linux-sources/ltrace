@@ -1,0 +1,90 @@
+#
+# ltrace's Makefile.in
+#
+
+#OS		:= $(shell uname -s)
+OS		:= @HOST_OS@
+
+TOPDIR		= $(shell pwd)
+
+prefix		= @prefix@
+sysconfdir	= @sysconfdir@
+bindir		= $(prefix)/bin
+mandir		= @mandir@
+docdir		= $(prefix)/share/doc/ltrace
+
+CC		=	@CC@
+CFLAGS		=	-Wall @CFLAGS@
+CPPFLAGS	=	@iquote@$(TOPDIR) @iquote@$(TOPDIR)/sysdeps/$(OS) @iquoteend@ @DEFS@ -DSYSCONFDIR=\"$(sysconfdir)\" @CPPFLAGS@
+LDFLAGS		=	@LDFLAGS@
+LIBS		=	@LIBS@
+
+INSTALL		=	@INSTALL@
+INSTALL_FILE	=	$(INSTALL) -p    -o root -g root  -m  644
+INSTALL_PROGRAM	=	$(INSTALL) -p    -o root -g root  -m  755
+INSTALL_SCRIPT	=	$(INSTALL) -p    -o root -g root  -m  755
+INSTALL_DIR	=	$(INSTALL) -p -d -o root -g root  -m  755
+
+OBJ	=	ltrace.o options.o elf.o output.o read_config_file.o	\
+		execute_program.o wait_for_something.o process_event.o	\
+		display_args.o breakpoints.o proc.o demangle.o dict.o \
+		debug.o summary.o
+
+VERSION	=	@PACKAGE_VERSION@
+
+all:		ltrace
+
+ltrace:		sysdeps/sysdep.o $(OBJ)
+		$(CC) $(LDFLAGS) $^ $(LIBS) -o $@
+
+sysdeps/sysdep.o: dummy
+		$(MAKE) -C sysdeps/$(OS)
+
+clean-deja:
+		$(RM) testrun.log testrun.sum
+		cd testsuite; make clean
+
+clean:		clean-deja
+		$(MAKE) -C sysdeps/$(OS) clean
+		rm -f ltrace $(OBJ)
+		rm -f *~ *.bak a.out core KK
+
+distclean:	clean
+		rm -f autogen.sh config.cache config.status config.log config.h Makefile configure.scan
+		rm -rf autom4te.cache
+		cd testsuite; make distclean
+
+realclean:	distclean
+		rm configure config.h.in
+
+dist:		clean
+		(if [ ! -d .svn ]; then echo "Sorry, can't make dist if not  a SVN checkout"; exit 1; fi ; \
+		rm -rf dist ; mkdir dist ; cd dist ; \
+		svn export ../ ltrace-$(VERSION); \
+		cd ltrace-$(VERSION); \
+                ./autogen.sh; \
+                rm autogen.sh; \
+		rm -rf autom4te.cache; \
+                cd ..; \
+                tar cfz ltrace-$(VERSION).tar.gz ./ltrace-$(VERSION); \
+                mv ltrace-$(VERSION).tar.gz ../; \
+                cd ..; \
+                rm -rf dist; \
+                echo "complete: ltrace-$(VERSION).tar.gz" )
+
+install:	ltrace
+		$(INSTALL_DIR) $(DESTDIR)$(bindir) $(DESTDIR)$(docdir) $(DESTDIR)$(mandir)/man1
+		$(INSTALL_DIR) $(DESTDIR)$(sysconfdir)
+		$(INSTALL_PROGRAM) ltrace $(DESTDIR)$(bindir)
+		$(INSTALL_FILE) etc/ltrace.conf $(DESTDIR)$(sysconfdir)
+		$(INSTALL_FILE) COPYING README TODO BUGS ChangeLog $(DESTDIR)$(docdir)
+		$(INSTALL_FILE) ltrace.1 $(DESTDIR)$(mandir)/man1
+
+check:
+		cd testsuite; $(MAKE) check
+
+dummy:
+
+.PHONY:		all clean distclean dist install dummy
+
+.EXPORT_ALL_VARIABLES:
