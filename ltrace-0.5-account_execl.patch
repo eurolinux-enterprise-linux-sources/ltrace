@@ -1,0 +1,208 @@
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-execl/ltrace.h
+--- ltrace-0.5/ltrace.h	2014-07-01 22:21:19.564178495 +0200
++++ ltrace-0.5-execl/ltrace.h	2014-07-01 22:10:14.589849276 +0200
+@@ -338,6 +338,8 @@ extern struct process *each_task(struct 
+ 							void * data),
+ 				 void * data);
+ 
++extern void summary_account_call(char const *name);
++
+ /* These three functions cooperate in installing process exit handler.
+  * LTRACE_EXITING is a back end function that is called to do the
+  * actual installation.  SHOULD_CALL_LTRACE_EXITING is called by a
+diff -urp ltrace-0.5/output.c ltrace-0.5-execl/output.c
+--- ltrace-0.5/output.c	2014-07-01 22:21:19.393177382 +0200
++++ ltrace-0.5-execl/output.c	2014-07-01 22:10:14.590849283 +0200
+@@ -244,36 +244,7 @@ void output_right(enum tof type, struct 
+ 	struct function *func = name2func(function_name);
+ 
+ 	if (opt_c) {
+-		struct opt_c_struct *st;
+-		if (!dict_opt_c) {
+-			dict_opt_c =
+-			    dict_init(dict_key2hash_string,
+-				      dict_key_cmp_string);
+-		}
+-		st = dict_find_entry(dict_opt_c, function_name);
+-		if (!st) {
+-			char *na;
+-			st = malloc(sizeof(struct opt_c_struct));
+-			na = strdup(function_name);
+-			if (!st || !na) {
+-				perror("malloc()");
+-				exit(1);
+-			}
+-			st->count = 0;
+-			st->tv.tv_sec = st->tv.tv_usec = 0;
+-			dict_enter(dict_opt_c, na, st);
+-		}
+-		if (st->tv.tv_usec + current_time_spent.tv_usec > 1000000) {
+-			st->tv.tv_usec += current_time_spent.tv_usec - 1000000;
+-			st->tv.tv_sec++;
+-		} else {
+-			st->tv.tv_usec += current_time_spent.tv_usec;
+-		}
+-		st->count++;
+-		st->tv.tv_sec += current_time_spent.tv_sec;
+-
+-//              fprintf(output, "%s <%lu.%06d>\n", function_name,
+-//                              current_time_spent.tv_sec, (int)current_time_spent.tv_usec);
++		summary_account_call(function_name);
+ 		return;
+ 	}
+ 	if (current_proc && (current_proc != proc ||
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-execl/process_event.c
+--- ltrace-0.5/process_event.c	2014-07-01 22:21:19.510178143 +0200
++++ ltrace-0.5-execl/process_event.c	2014-07-01 22:19:22.914418773 +0200
+@@ -322,6 +322,31 @@ void process_event(struct event *event)
+ 	}
+ }
+ 
++static void calc_time_spent(struct callstack_element *elem);
++
++/* Account the unfinished functions on the call stack.  */
++static void
++account_current_callstack(struct process *proc)
++{
++	if (! opt_c)
++		return;
++
++	ssize_t i;
++	for (i = proc->callstack_depth - 1; i >= 0; --i) {
++		struct callstack_element *elem = &proc->callstack[i];
++		char const *name;
++		if (elem->is_syscall)
++			name = sysname(proc, elem->c_un.syscall);
++		else
++			name = elem->c_un.libfunc->name;
++
++		if (name != NULL) {
++			calc_time_spent(elem);
++			summary_account_call(name);
++		}
++	}
++}
++
+ static void process_signal(struct event *event)
+ {
+ 	if (event->proc->state != STATE_IGNORED) {
+@@ -338,6 +363,7 @@ static void process_exit(struct event *e
+ 		output_line(event->proc, "+++ exited (status %d) +++",
+ 			    event->e_un.ret_val);
+ 	}
++	account_current_callstack(event->proc);
+ 	remove_process(event->proc);
+ }
+ 
+@@ -347,6 +373,7 @@ static void process_exit_signal(struct e
+ 		output_line(event->proc, "+++ killed by %s +++",
+ 			    shortsignal(event->proc, event->e_un.signum));
+ 	}
++	account_current_callstack(event->proc);
+ 	remove_process(event->proc);
+ }
+ 
+@@ -371,6 +398,7 @@ static void process_exec(struct event * 
+ 		return;
+ 	}
+ 	output_line(proc, "--- Called exec() ---");
++	account_current_callstack(proc);
+ 	proc->mask_32bit = 0;
+ 	proc->personality = 0;
+ 	proc->arch_ptr = NULL;
+@@ -384,14 +412,11 @@ static void process_exec(struct event * 
+ 
+ struct timeval current_time_spent;
+ 
+-static void calc_time_spent(struct process *proc)
++static void calc_time_spent(struct callstack_element *elem)
+ {
+ 	struct timeval tv;
+ 	struct timezone tz;
+ 	struct timeval diff;
+-	struct callstack_element *elem;
+-
+-	elem = &proc->callstack[proc->callstack_depth - 1];
+ 
+ 	gettimeofday(&tv, &tz);
+ 
+@@ -405,11 +430,17 @@ static void calc_time_spent(struct proce
+ 	current_time_spent = diff;
+ }
+ 
++static void
++calc_time_spent_tos(struct process *proc)
++{
++	calc_time_spent(&proc->callstack[proc->callstack_depth - 1]);
++}
++
+ static void process_sysret(struct event *event)
+ {
+ 	if (event->proc->state != STATE_IGNORED) {
+ 		if (opt_T || opt_c) {
+-			calc_time_spent(event->proc);
++			calc_time_spent_tos(event->proc);
+ 		}
+ 		assert(event->proc->callstack_depth > 0);
+ 		unsigned d = event->proc->callstack_depth - 1;
+@@ -479,7 +510,7 @@ static void process_breakpoint(struct ev
+ 			}
+ 			if (event->proc->state != STATE_IGNORED) {
+ 				if (opt_T || opt_c) {
+-					calc_time_spent(event->proc);
++					calc_time_spent_tos(event->proc);
+ 				}
+ 			}
+ 
+diff -urp ltrace-0.5/summary.c ltrace-0.5-execl/summary.c
+--- ltrace-0.5/summary.c	2014-07-01 22:21:19.024174980 +0200
++++ ltrace-0.5-execl/summary.c	2014-07-01 22:10:14.592849297 +0200
+@@ -5,6 +5,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/time.h>
++#include <string.h>
+ 
+ #include "ltrace.h"
+ #include "options.h"
+@@ -57,6 +58,40 @@ static int compar(const void *a, const v
+ 	}
+ }
+ 
++extern struct timeval current_time_spent;
++
++void
++summary_account_call(char const *name)
++{
++	struct opt_c_struct *st;
++	if (!dict_opt_c) {
++		dict_opt_c = dict_init(dict_key2hash_string,
++				       dict_key_cmp_string);
++	}
++	st = dict_find_entry(dict_opt_c, (void *)name);
++	if (!st) {
++		char *na;
++		st = malloc(sizeof(struct opt_c_struct));
++		na = strdup(name);
++		if (!st || !na) {
++			perror("malloc()");
++			exit(1);
++		}
++		st->count = 0;
++		st->tv.tv_sec = st->tv.tv_usec = 0;
++		dict_enter(dict_opt_c, na, st);
++	}
++
++	if (st->tv.tv_usec + current_time_spent.tv_usec > 1000000) {
++		st->tv.tv_usec += current_time_spent.tv_usec - 1000000;
++		st->tv.tv_sec++;
++	} else {
++		st->tv.tv_usec += current_time_spent.tv_usec;
++	}
++	st->count++;
++	st->tv.tv_sec += current_time_spent.tv_sec;
++}
++
+ void show_summary(void)
+ {
+ 	int i;

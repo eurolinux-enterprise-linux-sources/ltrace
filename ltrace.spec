@@ -1,7 +1,7 @@
 Summary: Tracks runtime library calls from dynamically linked executables
 Name: ltrace
 Version: 0.5
-Release: 23.45svn%{?dist}
+Release: 28.45svn%{?dist}
 URL: http://ltrace.alioth.debian.org/
 License: GPLv2+
 Group: Development/Debuggers
@@ -100,6 +100,12 @@ Patch162: ltrace-0.5-ppc64-linked-calls.patch
 Patch163: ltrace-0.5-ppc64-atomic-skip.patch
 # https://bugzilla.redhat.com/show_bug.cgi?id=811960
 Patch164: ltrace-0.5-warnings.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=868280
+Patch165: ltrace-0.5-pie.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=528466
+Patch166: ltrace-0.5-account_execl.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=891607
+Patch167: ltrace-0.5-clone-filename.patch
 
 %description
 Ltrace is a debugging program which runs a specified command until the
@@ -191,6 +197,9 @@ execution of processes.
 %patch162 -p1
 %patch163 -p1
 %patch164 -p1
+%patch165 -p1
+%patch166 -p1
+%patch167 -p1
 
 sed -i -e 's/-o root -g root//' Makefile.in
 
@@ -223,6 +232,26 @@ rm -rf $RPM_BUILD_ROOT
 %config(noreplace) %{_sysconfdir}/ltrace.conf
 
 %changelog
+* Thu Jul 10 2014 Petr Machata <pmachata@redhat.com> - 0.5-28.45svn
+- Fix specifically ppc64/ppc32 tracing of PIE binaries.
+  (Updated ltrace-0.5-pie.patch)
+
+* Tue Jul  8 2014 Petr Machata <pmachata@redhat.com> - 0.5-27.45svn
+- Fix 32/64 tracing of PIE binaries.
+  (Updated ltrace-0.5-pie.patch)
+
+* Mon Jul  7 2014 Petr Machata <pmachata@redhat.com> - 0.5-26.45svn
+- Fix a double free when tracing across fork
+  (ltrace-0.5-clone-filename.patch)
+
+* Tue Jul  1 2014 Petr Machata <pmachata@redhat.com> - 0.5-25.45svn
+- Fix a problem in including in summary (-c) function calls that don't
+  finish before exec or exit (ltrace-0.5-account_execl.patch)
+
+* Thu Jun 26 2014 Petr Machata <pmachata@redhat.com> - 0.5-24.45svn
+- Support PIE binaries (ltrace-0.5-pie.patch)
+- Resolves: #868280
+
 * Wed Apr 11 2012 Petr Machata <pmachata@redhat.com> - 0.5-23.45svn
 - Fix the case that a breakpoint is reported by SIGILL instead of
   SIGTRAP, and DECR_PC_AFTER_BREAK is non-zero, as is the case on

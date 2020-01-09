@@ -1,0 +1,214 @@
+diff -up ./elf.c~ ./elf.c
+--- ./elf.c~	2012-10-19 15:55:26.463178390 +0200
++++ ./elf.c	2012-10-19 16:36:32.598632411 +0200
+@@ -673,6 +673,19 @@ struct library_symbol *read_elf(struct p
+ 	memcpy(&main_lte, lte, sizeof(struct ltelf));
+ 
+ 	proc->e_machine = lte->ehdr.e_machine;
++	get_arch_dep(proc);
++	if (lte[0].ehdr.e_type == ET_DYN) {
++		void *entry;
++		if (process_get_entry(proc, &entry, NULL) < 0) {
++			fprintf(stderr, "Couldn't find entry of PIE %s\n",
++				proc->filename);
++			return NULL;
++		}
++		/* XXX The double cast should be removed when
++		 * arch_addr_t becomes integral type.  */
++		lte[0].bias = (GElf_Addr)(uintptr_t)entry - lte[0].ehdr.e_entry;
++	}
++
+ 	proc->dyn_addr = (void *)(uintptr_t)lte->dyn_addr;
+ 	if (proc->interp == NULL)
+ 		proc->interp = strdup(lte->interp);
+@@ -714,13 +726,16 @@ struct library_symbol *read_elf(struct p
+ 			if (lte->ehdr.e_machine == EM_PPC) {
+ 				addr = sym.st_value;
+ 				if (addr == 0 && lte->plt_stub_vma != 0)
+-					addr = lte->plt_stub_vma + PPC_PLT_STUB_SIZE * i;
++					addr = lte->plt_stub_vma
++						+ PPC_PLT_STUB_SIZE * i
++						+ lte[0].bias;
+ 				pltt = LS_TOPLT_EXEC;
+ 			}
+ 			else {
+ 				pltt = PLTS_ARE_EXECUTABLE(lte)
+ 					?  LS_TOPLT_EXEC : LS_TOPLT_POINT;
+-				addr = arch_plt_sym_val(lte, i, &rela);
++				addr = arch_plt_sym_val(lte, i, &rela)
++					+ lte[0].bias;
+ 			}
+ 
+ 			add_library_symbol(addr, name, &library_symbols, pltt,
+@@ -741,8 +756,8 @@ struct library_symbol *read_elf(struct p
+ 			      proc->filename);
+ 
+ 		name = lte->strtab + sym.st_name;
+-		addr = sym.st_value;
+-		if (!addr)
++		addr = sym.st_value + lte[0].bias;
++		if (sym.st_value == 0)
+ 			continue;
+ 
+ 		for (xptr = opt_x_loc; xptr; xptr = xptr->next)
+@@ -781,7 +796,8 @@ struct library_symbol *read_elf(struct p
+ 	}
+ 
+ 	if (lte->ehdr.e_entry != 0)
+-		*entryp = opd2addr(lte, (void *)(uintptr_t)lte->ehdr.e_entry);
++		*entryp = opd2addr(lte, (void *)(uintptr_t)lte->ehdr.e_entry)
++			+ lte[0].bias;
+ 
+ 	for (xptr = opt_x_loc; xptr; xptr = xptr->next)
+ 		if ( ! xptr->found) {
+diff -up ./ltrace.h~ ./ltrace.h
+--- ./ltrace.h~	2012-10-19 15:55:26.435178215 +0200
++++ ./ltrace.h	2012-10-19 16:06:35.971373880 +0200
+@@ -350,5 +350,14 @@ int should_call_ltrace_exiting(void);
+ void check_ltrace_exiting(void);
+ void ltrace_exiting(void);
+ 
++/* This should extract entry point address and interpreter (dynamic
++ * linker) bias if possible.  Returns 0 if there were no errors, -1
++ * otherwise.  Sets *ENTRYP and *INTERP_BIASP to non-zero values if
++ * the corresponding value is known, or zero otherwise; this is not
++ * done for pointers that are NULL.  */
++int process_get_entry(struct process *proc,
++		      void **entryp,
++		      void **interp_biasp);
++
+ extern ulong get_child_pid(pid_t pid);
+ #endif
+diff -up ./sysdeps/linux-gnu/proc.c~ ./sysdeps/linux-gnu/proc.c
+--- ./sysdeps/linux-gnu/proc.c~	2012-10-19 15:55:26.462178384 +0200
++++ ./sysdeps/linux-gnu/proc.c	2012-10-19 16:07:34.211738808 +0200
+@@ -438,6 +438,32 @@ rdebug_fetcher(struct process *proc))(st
+ 	return select_32_64(proc, fetch_rd32, fetch_rd64);
+ }
+ 
++static int
++fetch_auxv64_entry(int fd, Elf64_auxv_t *ret)
++{
++	/* Reaching EOF is as much problem as not reading whole
++	 * entry.  */
++	return read(fd, ret, sizeof(*ret)) == sizeof(*ret) ? 0 : -1;
++}
++
++static int
++fetch_auxv32_entry(int fd, Elf64_auxv_t *ret)
++{
++	Elf32_auxv_t auxv;
++	if (read(fd, &auxv, sizeof(auxv)) != sizeof(auxv))
++		return -1;
++
++	ret->a_type = auxv.a_type;
++	ret->a_un.a_val = auxv.a_un.a_val;
++	return 0;
++}
++
++static int (*
++auxv_fetcher(struct process *proc))(int, Elf64_auxv_t *)
++{
++	return select_32_64(proc, fetch_auxv32_entry, fetch_auxv64_entry);
++}
++
+ static void
+ crawl_linkmap(struct process *proc, struct lt_r_debug_64 *dbg,
+ 	      void (*callback)(void *), struct cb_data *data)
+@@ -755,3 +781,53 @@ linkmap_init(struct process *proc)
+ 
+ 	return 0;
+ }
++
++int
++process_get_entry(struct process *proc,
++		  void **entryp,
++		  void **interp_biasp)
++{
++	PROC_PID_FILE(fn, "/proc/%d/auxv", proc->pid);
++	int fd = open(fn, O_RDONLY);
++	if (fd == -1) {
++	fail:
++		fprintf(stderr, "couldn't read %s: %s", fn, strerror(errno));
++	done:
++		if (fd != -1)
++			close(fd);
++		return fd == -1 ? -1 : 0;
++	}
++
++	void *at_entry = 0;
++	void *at_bias = 0;
++	while (1) {
++		Elf64_auxv_t entry;
++		if (auxv_fetcher(proc)(fd, &entry) < 0)
++			goto fail;
++
++		switch (entry.a_type) {
++		case AT_BASE:
++			/* XXX The double cast should be removed when
++			 * arch_addr_t becomes integral type.  */
++			at_bias = (void *)(uintptr_t)entry.a_un.a_val;
++			continue;
++
++		case AT_ENTRY:
++			/* XXX The double cast should be removed when
++			 * arch_addr_t becomes integral type.  */
++			at_entry = (void *)(uintptr_t)entry.a_un.a_val;
++		default:
++			continue;
++
++		case AT_NULL:
++			break;
++		}
++		break;
++	}
++
++	if (entryp != NULL)
++		*entryp = at_entry;
++	if (interp_biasp != NULL)
++		*interp_biasp = at_bias;
++	goto done;
++}
+diff -up ./testsuite/ltrace.main/main-pie.exp~ ./testsuite/ltrace.main/main-pie.exp
+--- ./testsuite/ltrace.main/main-pie.exp~	2012-10-19 16:47:16.282666046 +0200
++++ ./testsuite/ltrace.main/main-pie.exp	2012-10-19 16:36:11.782501965 +0200
+@@ -0,0 +1,39 @@
++# This file was written by Yao Qi <qiyao@cn.ibm.com>.
++
++set testfile "main"
++set srcfile ${testfile}.c
++set binfile ${testfile}-pie
++set libfile "main-lib"
++set libsrc $srcdir/$subdir/$libfile.c
++set lib_sl $srcdir/$subdir/lib$testfile.so
++
++
++if [get_compiler_info $binfile] {
++  return -1
++}
++
++verbose "compiling source file now....."
++if { [ltrace_compile_shlib $libsrc $lib_sl debug ] != "" 
++  || [ltrace_compile $srcdir/$subdir/$srcfile $srcdir/$subdir/$binfile executable [list debug shlib=$lib_sl additional_flags=-fpic additional_flags=-pie] ] != ""} {
++  send_user "Testcase compile failed, so all tests in this file will automatically fail.\n"
++}
++
++# set options for ltrace.
++ltrace_options "-l" "$srcdir/$subdir/libmain.so"
++
++# Run PUT for ltarce.
++set exec_output [ltrace_runtest $srcdir/$subdir $srcdir/$subdir/$binfile]
++
++# Check the output of this program.
++verbose "ltrace runtest output: $exec_output\n"
++if [regexp {ELF from incompatible architecture} $exec_output] {
++	fail "32-bit ltrace can not perform on 64-bit PUTs and rebuild ltrace in 64 bit mode!"
++	return 
++} elseif [ regexp {Couldn't get .hash data} $exec_output ] {
++	fail "Couldn't get .hash data!"
++	return
++}
++
++# Verify the output by checking numbers of print in main.ltrace.
++set pattern "print"
++ltrace_verify_output ${srcdir}/${subdir}/${testfile}-pie.ltrace $pattern 10
