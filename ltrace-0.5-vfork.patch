@@ -1,0 +1,968 @@
+diff --git a/breakpoints.c b/breakpoints.c
+index 1eff8b0..387b2a5 100644
+--- a/breakpoints.c
++++ b/breakpoints.c
+@@ -203,14 +203,7 @@ breakpoints_init(Process *proc, int enable)
+ 	proc->breakpoints = dict_init(dict_key2hash_int,
+ 				      dict_key_cmp_int);
+ 
+-	if (proc->list_of_symbols != NULL) {
+-		struct library_symbol * sym = proc->list_of_symbols;
+-		while (sym != NULL) {
+-			struct library_symbol * next = sym->next;
+-			free(sym);
+-			sym = next;
+-		}
+-	}
++	destroy_library_symbol_chain(proc->list_of_symbols);
+ 	proc->list_of_symbols = NULL;
+ 
+ 	if (opt_L && proc->filename) {
+diff --git a/common.h b/common.h
+index 49861cf..c0b24e5 100644
+--- a/ltrace.h
++++ b/ltrace.h
+@@ -200,6 +200,7 @@ enum process_status {
+ 	ps_invalid,	/* Failure.  */
+ 	ps_stop,	/* Job-control stop.  */
+ 	ps_tracing_stop,
++	ps_sleeping,
+ 	ps_zombie,
+ 	ps_other,	/* Necessary other states can be added as needed.  */
+ };
+@@ -255,6 +255,10 @@ extern void open_pid(pid_t pid, int verb
+ extern void open_forked_pid(pid_t pid, int early);
+ extern void show_summary(void);
+ 
++extern struct library_symbol * clone_library_symbol(struct library_symbol * s);
++extern void destroy_library_symbol(struct library_symbol * s);
++extern void destroy_library_symbol_chain(struct library_symbol * chain);
++
+ /* Arch-dependent stuff: */
+ extern char *pid2name(pid_t pid);
+ extern pid_t process_leader(pid_t pid);
+@@ -280,6 +280,7 @@ extern int syscall_p(struct process *pro
+ extern void continue_process(pid_t pid);
+ extern void continue_after_signal(pid_t pid, int signum);
+ extern void continue_after_breakpoint(struct process *proc, struct breakpoint *sbp);
++extern void continue_after_vfork(struct process * proc);
+ extern void ltrace_exiting(void);
+ extern void continue_enabling_breakpoint(struct process *proc,
+ 					 struct breakpoint *sbp);
+@@ -292,6 +293,7 @@ extern int task_kill (pid_t pid, int sig
+ extern struct process *pid2proc(int pid);
+ extern void add_process(struct process * proc);
+ extern void remove_process(struct process * proc);
++extern void change_process_leader(struct process * proc, struct process * leader);
+ extern struct process *each_process(struct process * start,
+ 				    enum pcb_status (* cb)(struct process *,
+ 							   void * data),
+diff --git a/dict.c b/dict.c
+index 486a461..ba318cd 100644
+--- a/dict.c
++++ b/dict.c
+@@ -167,7 +167,9 @@ int dict_key_cmp_int(void *key1, void *k
+ 	return key1 - key2;
+ }
+ 
+-struct dict *dict_clone(struct dict *old, void * (*key_clone)(void*), void * (*value_clone)(void*)) {
++struct dict *dict_clone2(struct dict *old, void * (*key_clone)(void*, void*),
++			 void * (*value_clone)(void*, void*), void *data)
++{
+ 	struct dict *d;
+ 	int i;
+ 
+@@ -190,8 +192,8 @@ struct dict *dict_clone(struct dict *old
+ 				exit(1);
+ 			}
+ 			memcpy(*de_new, de_old, sizeof(struct dict_entry));
+-			(*de_new)->key = key_clone(de_old->key);
+-			(*de_new)->value = value_clone(de_old->value);
++			(*de_new)->key = key_clone(de_old->key, data);
++			(*de_new)->value = value_clone(de_old->value, data);
+ 			de_new = &(*de_new)->next;
+ 			de_old = de_old->next;
+ 		}
+@@ -199,3 +201,28 @@ struct dict *dict_clone(struct dict *old
+ 	return d;
+ }
+ 
++struct wrap_clone_cb
++{
++	void * (*key_clone)(void *);
++	void * (*value_clone)(void *);
++};
++
++static void *
++value_clone_1(void * arg, void * data)
++{
++	return ((struct wrap_clone_cb *)data)->value_clone(arg);
++}
++
++static void *
++key_clone_1(void * arg, void * data)
++{
++	return ((struct wrap_clone_cb *)data)->key_clone(arg);
++}
++
++struct dict *
++dict_clone(struct dict * old, void * (*key_clone)(void *),
++	   void * (*value_clone)(void *))
++{
++	struct wrap_clone_cb cb = { key_clone, value_clone };
++	return dict_clone2(old, &key_clone_1, &value_clone_1, &cb);
++}
+diff --git a/dict.h b/dict.h
+index a70c3d5..27dc7bf 100644
+--- a/dict.h
++++ b/dict.h
+@@ -18,3 +18,5 @@ extern int dict_key_cmp_string(void *key
+ extern unsigned int dict_key2hash_int(void *key);
+ extern int dict_key_cmp_int(void *key1, void *key2);
+ extern struct dict * dict_clone(struct dict *old, void * (*key_clone)(void*), void * (*value_clone)(void*));
++extern struct dict * dict_clone2(struct dict *old, void * (*key_clone)(void*, void*),
++				 void * (*value_clone)(void*, void*), void *data);
+--- a/process_event.c	2011-09-27 21:58:40.972954149 +0200
++++ b/process_event.c	2011-09-27 21:58:25.349953795 +0200
+@@ -9,6 +9,7 @@
+ #include <signal.h>
+ #include <assert.h>
+ #include <sys/time.h>
++#include <errno.h>
+ 
+ #include "ltrace.h"
+ #include "output.h"
+@@ -35,18 +36,29 @@
+ static void callstack_pop(struct process *proc);
+ 
+ /* TODO */
++static int clone_breakpoints(struct process * proc, struct process * orig_proc);
+-void * address_clone(void * addr) {
++void * address_clone(void * addr, void * data) {
+ 	return addr;
+ }
+ 
+-void * breakpoint_clone(void * bp) {
++void * breakpoint_clone(void * bp, void * data) {
+ 	struct breakpoint * b;
++	struct dict * map = data;
+ 	b = malloc(sizeof(struct breakpoint));
+ 	if (!b) {
+ 		perror("malloc()");
+ 		exit(1);
+ 	}
+ 	memcpy(b, bp, sizeof(struct breakpoint));
++	if (b->libsym != NULL) {
++		struct library_symbol * sym = dict_find_entry(map, b->libsym);
++		if (b->libsym == NULL) {
++			fprintf(stderr, "Can't find cloned symbol %s.\n",
++				b->libsym->name);
++			return NULL;
++		}
++		b->libsym = sym;
++	}
+ 	return b;
+ }
+ 
+@@ -108,7 +119,6 @@
+ 		exit(1);
+ 	}
+ 	memcpy(p, event->proc, sizeof(struct process));
+-	p->breakpoints = dict_clone(event->proc->breakpoints, address_clone, breakpoint_clone);
+ 	p->pid = event->e_un.newpid;
+ 	p->parent = event->proc;
+ 
+@@ -131,7 +141,17 @@
+ 		p->state = STATE_BEING_CREATED;
+ 		add_process(p);
+ 	}
+-	continue_process(event->proc->pid);
++
++	if (p->leader == p)
++		clone_breakpoints(p, event->proc->leader);
++	else
++		/* Thread groups share breakpoints.  */
++		p->breakpoints = NULL;
++
++	if (event->thing == LT_EV_VFORK)
++		continue_after_vfork(p);
++	else
++		continue_process(event->proc->pid);
+ }
+ 
+ static void process_new(struct event * event) {
+@@ -140,8 +160,6 @@
+ 		pending_new_insert(event->e_un.newpid);
+ 	} else {
+ 		assert(proc->state == STATE_BEING_CREATED);
+-		if (proc->event_handler != NULL)
+-			destroy_event_handler(proc);
+ 		if (opt_f) {
+ 			proc->state = STATE_ATTACHED;
+ 		} else {
+@@ -199,6 +217,18 @@
+ 	}
+ }
+ 
++static struct event *
++call_handler(struct process * proc, struct event * event)
++{
++	assert(proc != NULL);
++
++	Event_Handler * handler = proc->event_handler;
++	if (handler == NULL)
++		return event;
++
++	return (*handler->on_event) (handler, event);
++}
++
+ void process_event(struct event *event)
+ {
+ 	if (exiting == 1) {
+@@ -207,13 +237,20 @@
+ 		ltrace_exiting();
+ 	}
+ 
+-	/* If the thread group defines an overriding event handler,
+-	   give it a chance to kick in.  */
+-	if (event->proc != NULL
+-	    && event->proc->leader != NULL) {
+-		Event_Handler * handler = event->proc->leader->event_handler;
+-		if (handler != NULL) {
+-			event = (*handler->on_event) (handler, event);
++	/* If the thread group or an individual task define an
++	   overriding event handler, give them a chance to kick in.
++	   We will end up calling both handlers, if the first one
++	   doesn't sink the event.  */
++	if (event->proc != NULL) {
++		event = call_handler(event->proc, event);
++		if (event == NULL)
++			/* It was handled.  */
++			return;
++
++		/* Note: the previous handler has a chance to alter
++		 * the event.  */
++		if (event->proc->leader != NULL) {
++			event = call_handler(event->proc->leader, event);
+ 			if (event == NULL)
+ 				/* It was handled.  */
+ 				return;
+@@ -253,6 +290,7 @@
+ 		process_sysret(event);
+ 		return;
+ 	case LT_EV_CLONE:
++	case LT_EV_VFORK:
+ 		debug(1, "event: clone (%u)", event->e_un.newpid);
+ 		process_clone(event);
+ 		return;
+@@ -501,6 +539,40 @@
+ 	}
+ }
+ 
++static int
++clone_breakpoints(struct process * proc, struct process * orig_proc)
++{
++	/* When copying breakpoints, we also have to copy the
++	 * referenced symbols, and link them properly.  */
++	struct dict * map = dict_init(&dict_key2hash_int, &dict_key_cmp_int);
++	struct library_symbol * it = proc->list_of_symbols;
++	proc->list_of_symbols = NULL;
++	for (; it != NULL; it = it->next) {
++		struct library_symbol * libsym = clone_library_symbol(it);
++		if (libsym == NULL) {
++			int save_errno;
++		err:
++			save_errno = errno;
++			destroy_library_symbol_chain(proc->list_of_symbols);
++			dict_clear(map);
++			errno = save_errno;
++			return -1;
++		}
++		libsym->next = proc->list_of_symbols;
++		proc->list_of_symbols = libsym;
++		if (dict_enter(map, it, libsym) != 0)
++			goto err;
++	}
++
++	proc->breakpoints = dict_clone2(orig_proc->breakpoints,
++					address_clone, breakpoint_clone, map);
++	if (proc->breakpoints == NULL)
++		goto err;
++
++	dict_clear(map);
++	return 0;
++}
++
+ static void
+ callstack_push_symfunc(struct process *proc, struct library_symbol *sym)
+ {
+diff --git a/ltrace-elf.c b/ltrace-elf.c
+index 60fe2e9..9aea4a9 100644
+--- a/elf.c
++++ b/elf.c
+@@ -309,13 +309,28 @@
+ 	close(lte->fd);
+ }
+ 
++static struct library_symbol *
++create_library_symbol(const char * name, GElf_Addr addr)
++{
++	size_t namel = strlen(name) + 1;
++	struct library_symbol * sym = calloc(sizeof(*sym) + namel, 1);
++	if (sym == NULL) {
++		perror("create_library_symbol");
++		return NULL;
++	}
++	sym->name = (char *)(sym + 1);
++	memcpy(sym->name, name, namel);
++	sym->enter_addr = (void *)(uintptr_t) addr;
++	return sym;
++}
++
+ static void
+ add_library_symbol(GElf_Addr addr, const char *name,
+ 		   struct library_symbol **library_symbolspp,
+ 		   enum toplt type_of_plt, int is_weak)
+ {
+ 	struct library_symbol *s;
+-	s = malloc(sizeof(struct library_symbol) + strlen(name) + 1);
++	s = create_library_symbol(name, addr);
+ 	if (s == NULL)
+ 		error(EXIT_FAILURE, errno, "add_library_symbol failed");
+ 
+@@ -323,15 +338,45 @@
+ 	s->is_weak = is_weak;
+ 	s->plt_type = type_of_plt;
+ 	s->next = *library_symbolspp;
+-	s->enter_addr = (void *)(uintptr_t) addr;
+ 	s->brkpnt = NULL;
+-	s->name = (char *)(s + 1);
+-	strcpy(s->name, name);
+ 	*library_symbolspp = s;
+ 
+ 	debug(2, "addr: %p, symbol: \"%s\"", (void *)(uintptr_t) addr, name);
+ }
+ 
++struct library_symbol *
++clone_library_symbol(struct library_symbol * sym)
++{
++	struct library_symbol * copy
++		= create_library_symbol(sym->name,
++					(GElf_Addr)(uintptr_t)sym->enter_addr);
++	if (copy == NULL)
++		return NULL;
++
++	copy->needs_init = sym->needs_init;
++	copy->is_weak = sym->is_weak;
++	copy->plt_type = sym->plt_type;
++	copy->brkpnt = sym->brkpnt;
++
++	return copy;
++}
++
++void
++destroy_library_symbol(struct library_symbol * sym)
++{
++	free(sym);
++}
++
++void
++destroy_library_symbol_chain(struct library_symbol * sym)
++{
++	while (sym != NULL) {
++		struct library_symbol * next = sym->next;
++		destroy_library_symbol(sym);
++		sym = next;
++	}
++}
++
+ static int in_load_libraries(const char *name, struct ltelf *lte)
+ {
+ 	size_t i;
+diff --git a/ltrace.h b/ltrace.h
+index 0ff4572..194704d 100644
+--- a/ltrace.h
++++ b/ltrace.h
+@@ -184,6 +184,7 @@ struct event {
+ 		LT_EV_SYSCALL,
+ 		LT_EV_SYSRET,
+ 		LT_EV_CLONE,
++		LT_EV_VFORK,
+ 		LT_EV_EXEC,
+ 		LT_EV_BREAKPOINT,
+ 		LT_EV_NEW
+diff --git a/proc.c b/proc.c
+index 0425e09..f4d3396 100644
+--- a/proc.c
++++ b/proc.c
+@@ -150,6 +150,28 @@ void open_forked_pid(pid_t pid, int earl
+ 
+ static struct process * list_of_processes = NULL;
+ 
++static void
++unlist_process(struct process * proc)
++{
++	struct process *tmp;
++
++	if (list_of_processes == proc) {
++		list_of_processes = list_of_processes->next;
++		return;
++	}
++
++	for (tmp = list_of_processes; ; tmp = tmp->next) {
++		/* If the following assert fails, the process wasn't
++		 * in the list.  */
++		assert(tmp->next != NULL);
++
++		if (tmp->next == proc) {
++			tmp->next = tmp->next->next;
++			return;
++		}
++	}
++}
++
+ struct process *
+ each_process(struct process * proc,
+ 	     enum pcb_status (* cb)(struct process * proc, void * data),
+@@ -213,6 +234,23 @@ add_process(struct process * proc)
+ 	*leaderp = proc;
+ }
+ 
++void
++change_process_leader(struct process * proc, struct process * leader)
++{
++	struct process ** leaderp = &list_of_processes;
++	if (proc->leader == leader)
++		return;
++
++	assert(leader != NULL);
++	unlist_process(proc);
++	if (proc != leader)
++		leaderp = &leader->next;
++
++	proc->leader = leader;
++	proc->next = *leaderp;
++	*leaderp = proc;
++}
++
+ static enum pcb_status
+ clear_leader(struct process * proc, void * data)
+ {
+@@ -242,29 +280,12 @@ delete_events_for(struct process * proc)
+ void
+ remove_process(struct process *proc)
+ {
+-	struct process *tmp, *tmp2;
+-
+ 	if (proc->leader == proc)
+ 		each_task(proc, &clear_leader, NULL);
+ 
+-	if (list_of_processes == proc) {
+-		tmp = list_of_processes;
+-		list_of_processes = list_of_processes->next;
+-		delete_events_for(tmp);
+-		free(tmp);
+-		return;
+-	}
+-	tmp = list_of_processes;
+-	while (tmp->next) {
+-		if (tmp->next == proc) {
+-			tmp2 = tmp->next;
+-			tmp->next = tmp->next->next;
+-			delete_events_for(tmp2);
+-			free(tmp2);
+-			return;
+-		}
+-		tmp = tmp->next;
+-	}
++	unlist_process(proc);
++	delete_events_for(proc);
++	free(proc);
+ }
+ 
+ void
+@@ -283,6 +304,7 @@ destroy_event_handler(struct process * proc)
+ 	Event_Handler * handler = proc->event_handler;
+ 	assert(handler != NULL);
+-	handler->destroy(handler);
++	if (handler->destroy != NULL)
++		handler->destroy(handler);
+ 	free(handler);
+ 	proc->event_handler = NULL;
+ }
+diff --git a/sysdeps/linux-gnu/events.c b/sysdeps/linux-gnu/events.c
+index 8a79583..0685342 100644
+--- a/wait_for_something.c
++++ b/wait_for_something.c
+@@ -270,12 +270,18 @@ struct event *wait_for_something(void)
+ 		if (errno != 0)
+ 			perror("syscall_p");
+ 	}
+-	if (WIFSTOPPED(status) && ((status>>16 == PTRACE_EVENT_FORK) || (status>>16 == PTRACE_EVENT_VFORK) || (status>>16 == PTRACE_EVENT_CLONE))) {
+-		unsigned long data;
+-		ptrace(PTRACE_GETEVENTMSG, pid, NULL, &data);
+-		event.thing = LT_EV_CLONE;
+-		event.e_un.newpid = data;
+-		return &event;
++	if (WIFSTOPPED(status)) {
++		int what = status >> 16;
++		if (what == PTRACE_EVENT_VFORK
++		    || what == PTRACE_EVENT_FORK
++		    || what == PTRACE_EVENT_CLONE) {
++			unsigned long data;
++			event.thing = what == PTRACE_EVENT_VFORK
++				? LT_EV_VFORK : LT_EV_CLONE;
++			ptrace(PTRACE_GETEVENTMSG, pid, NULL, &data);
++			event.e_un.newpid = data;
++			return &event;
++		}
+ 	}
+ 	/* TODO: check for EVENT_CLONE */
+ 	if (WIFSTOPPED(status) && (status>>16 == PTRACE_EVENT_EXEC)) {
+diff --git a/sysdeps/linux-gnu/proc.c b/sysdeps/linux-gnu/proc.c
+index e3b71e5..a99593c 100644
+--- a/sysdeps/linux-gnu/proc.c
++++ b/sysdeps/linux-gnu/proc.c
+@@ -148,7 +148,7 @@ process_status_cb(const char * line, const char * prefix, void * data)
+ 	switch (c) {
+ 	case 'Z': RETURN(ps_zombie);
+ 	case 't': RETURN(ps_tracing_stop);
+-	case 'T': {
++	case 'T':
+ 		/* This can be either "T (stopped)" or, for older
+ 		 * kernels, "T (tracing stop)".  */
+ 		if (!strcmp(status, "T (stopped)\n"))
+@@ -161,7 +161,8 @@ process_status_cb(const char * line, const char * prefix, void * data)
+ 			RETURN(ps_stop); /* Some sort of stop
+ 					  * anyway.  */
+ 		}
+-	}
++	case 'D':
++	case 'S': RETURN(ps_sleeping);
+ 	}
+ 
+ 	RETURN(ps_other);
+diff --git a/sysdeps/linux-gnu/trace.c b/sysdeps/linux-gnu/trace.c
+index f8a1779..ba3806d 100644
+--- a/sysdeps/linux-gnu/trace.c
++++ b/sysdeps/linux-gnu/trace.c
+@@ -164,9 +164,10 @@ continue_process(pid_t pid)
+ struct pid_task {
+ 	pid_t pid;	/* This may be 0 for tasks that exited
+ 			 * mid-handling.  */
+-	int sigstopped;
+-	int got_event;
+-	int delivered;
++	int sigstopped : 1;
++	int got_event : 1;
++	int delivered : 1;
++	int vforked : 1;
+ } * pids;
+ 
+ struct pid_set {
+@@ -213,23 +214,6 @@ struct process_stopping_handler
+ 	struct pid_set pids;
+ };
+ 
+-static enum pcb_status
+-task_stopped(struct process * task, void * data)
+-{
+-	/* If the task is already stopped, don't worry about it.
+-	 * Likewise if it managed to become a zombie or terminate in
+-	 * the meantime.  This can happen when the whole thread group
+-	 * is terminating.  */
+-	switch (process_status(task->pid)) {
+-	case ps_invalid:
+-	case ps_tracing_stop:
+-	case ps_zombie:
+-		return pcb_cont;
+-	default:
+-		return pcb_stop;
+-	}
+-}
+-
+ static struct pid_task *
+ get_task_info(struct pid_set * pids, pid_t pid)
+ {
+@@ -261,6 +245,57 @@ add_task_info(struct pid_set * pids, pid_t pid)
+ }
+ 
+ static enum pcb_status
++task_stopped(struct process * task, void * data)
++{
++	enum process_status st = process_status(task->pid);
++	if (data != NULL)
++		*(enum process_status *)data = st;
++
++	/* If the task is already stopped, don't worry about it.
++	 * Likewise if it managed to become a zombie or terminate in
++	 * the meantime.  This can happen when the whole thread group
++	 * is terminating.  */
++	switch (st) {
++	case ps_invalid:
++	case ps_tracing_stop:
++	case ps_zombie:
++		return pcb_cont;
++	default:
++		return pcb_stop;
++	}
++}
++
++/* Task is blocked if it's stopped, or if it's a vfork parent.  */
++static enum pcb_status
++task_blocked(struct process * task, void * data)
++{
++	struct pid_set * pids = data;
++	struct pid_task * task_info = get_task_info(pids, task->pid);
++	if (task_info != NULL
++	    && task_info->vforked)
++		return pcb_cont;
++
++	return task_stopped(task, NULL);
++}
++
++static struct event * process_vfork_on_event(Event_Handler * super, struct event * event);
++
++static enum pcb_status
++task_vforked(struct process * task, void * data)
++{
++	if (task->event_handler != NULL
++	    && task->event_handler->on_event == &process_vfork_on_event)
++		return pcb_stop;
++	return pcb_cont;
++}
++
++static int
++is_vfork_parent(struct process * task)
++{
++	return each_task(task->leader, &task_vforked, NULL) != NULL;
++}
++
++static enum pcb_status
+ send_sigstop(struct process * task, void * data)
+ {
+ 	struct process * leader = task->leader;
+@@ -283,9 +318,11 @@ send_sigstop(Process * task, void * data)
+ 		return pcb_cont;
+ 
+ 	/* Don't bother sending SIGSTOP if we are already stopped, or
+-	 * if we sent the SIGSTOP already, which happens when we
+-	 * inherit the handler from breakpoint re-enablement.  */
+-	if (task_stopped(task, NULL) == pcb_cont)
++	 * if we sent the SIGSTOP already, which happens when we are
++	 * handling "onexit" and inherited the handler from breakpoint
++	 * re-enablement.  */
++	enum process_status st;
++	if (task_stopped(task, &st) == pcb_cont)
+ 		return pcb_cont;
+ 	if (task_info->sigstopped) {
+ 		if (!task_info->delivered)
+@@ -293,6 +330,16 @@ send_sigstop(Process * task, void * data)
+ 		task_info->delivered = 0;
+ 	}
+ 
++	/* Also don't attempt to stop the process if it's a parent of
++	 * vforked process.  We set up event handler specially to hint
++	 * us.  In that case parent is in D state, which we use to
++	 * weed out unnecessary looping.  */
++	if (st == ps_sleeping
++	    && is_vfork_parent (task)) {
++		task_info->vforked = 1;
++		return pcb_cont;
++	}
++
+ 	if (task_kill(task->pid, SIGSTOP) >= 0) {
+ 		task_info->sigstopped = 1;
+ 	} else
+@@ -519,7 +519,7 @@ process_stopping_on_event(Event_Handler 
+ 	switch (state) {
+ 	case psh_stopping:
+ 		/* If everyone is stopped, singlestep.  */
+-		if (each_task(leader, &task_stopped, NULL) == NULL) {
++		if (each_task(leader, &task_blocked, &self->pids) == NULL) {
+ 			if (sbp->enabled)
+ 				disable_breakpoint(teb, sbp);
+ 			if (ptrace(PTRACE_SINGLESTEP, teb->pid, 0, 0))
+@@ -742,6 +789,109 @@ ltrace_exiting_install_handler(Process * proc)
+ 	return 0;
+ }
+ 
++/*
++ * When the traced process vforks, it's suspended until the child
++ * process calls _exit or exec*.  In the meantime, the two share the
++ * address space.
++ *
++ * The child process should only ever call _exit or exec*, but we
++ * can't count on that (it's not the role of ltrace to policy, but to
++ * observe).  In any case, we will _at least_ have to deal with
++ * removal of vfork return breakpoint (which we have to smuggle back
++ * in, so that the parent can see it, too), and introduction of exec*
++ * return breakpoint.  Since we already have both breakpoint actions
++ * to deal with, we might as well support it all.
++ *
++ * The gist is that we pretend that the child is in a thread group
++ * with its parent, and handle it as a multi-threaded case, with the
++ * exception that we know that the parent is blocked, and don't
++ * attempt to stop it.  When the child execs, we undo the setup.
++ *
++ * XXX The parent process could be un-suspended before ltrace gets
++ * child exec/exit event.  Make sure this is taken care of.
++ */
++
++struct process_vfork_handler
++{
++	Event_Handler super;
++	void * bp_addr;
++};
++
++static struct event *
++process_vfork_on_event(Event_Handler * super, struct event * event)
++{
++	struct process_vfork_handler * self = (void *)super;
++	struct breakpoint * sbp;
++	assert(self != NULL);
++
++	switch (event->thing) {
++	case LT_EV_BREAKPOINT:
++		/* Remember the vfork return breakpoint.  */
++		if (self->bp_addr == NULL)
++			self->bp_addr = event->e_un.brk_addr;
++		break;
++
++	case LT_EV_EXIT:
++	case LT_EV_EXIT_SIGNAL:
++	case LT_EV_EXEC:
++		/* Smuggle back in the vfork return breakpoint, so
++		 * that our parent can trip over it once again.  */
++		if (self->bp_addr != NULL) {
++			sbp = dict_find_entry(event->proc->leader->breakpoints,
++					      self->bp_addr);
++			if (sbp != NULL)
++				insert_breakpoint(event->proc->parent,
++						  self->bp_addr, sbp->libsym,
++						  1);
++		}
++
++		continue_process(event->proc->parent->pid);
++
++		/* Remove the leader that we artificially set up
++		 * earlier.  */
++		change_process_leader(event->proc, event->proc);
++		destroy_event_handler(event->proc);
++
++		/* XXXXX this could happen in the middle of handling
++		 * multi-threaded breakpoint.  We must be careful to
++		 * undo the effects that we introduced above (vforked
++		 * = 1 et.al.).  */
++
++	default:
++		;
++	}
++
++	return event;
++}
++
++void
++continue_after_vfork(struct process * proc)
++{
++	struct process_vfork_handler * handler = calloc(sizeof(*handler), 1);
++	if (handler == NULL) {
++		perror("malloc vfork handler");
++		/* Carry on not bothering to treat the process as
++		 * necessary.  */
++		continue_process(proc->parent->pid);
++		return;
++	}
++
++	/* We must set up custom event handler, so that we see
++	 * exec/exit events for the task itself.  */
++	handler->super.on_event = process_vfork_on_event;
++	install_event_handler(proc, &handler->super);
++
++	/* Make sure that the child is sole thread.  */
++	assert(proc->leader == proc);
++	assert(proc->next == NULL || proc->next->leader != proc);
++
++	/* Make sure that the child's parent is properly set up.  */
++	assert(proc->parent != NULL);
++	assert(proc->parent->leader != NULL);
++
++	change_process_leader(proc, proc->parent->leader);
++}
++
+ /* If ltrace gets SIGINT, the processes directly or indirectly run by
+  * ltrace get it too.  We just have to wait long enough for the signal
+  * to be delivered and the process terminated, which we notice and
+diff --git a/testsuite/ltrace.main/main-vfork.c b/testsuite/ltrace.main/main-vfork.c
+new file mode 100644
+index 0000000..a5f6c40
+--- /dev/null
++++ b/testsuite/ltrace.main/main-vfork.c
+@@ -0,0 +1,28 @@
++#include <unistd.h>
++
++extern void print (char *);
++
++#define	PRINT_LOOP	10
++
++void
++th_main (char * arg)
++{
++  int i;
++  for (i=0; i<PRINT_LOOP; i++)
++    print (arg);
++}
++
++int main (int argc, char ** argv)
++{
++  if (argc != 1)
++    {
++      th_main ("aaa");
++      return 0;
++    }
++
++  if (!vfork ())
++    execlp (argv[0], argv[0], "", NULL);
++  th_main ("bbb");
++
++  return 0;
++}
+diff --git a/testsuite/ltrace.main/main-vfork.exp b/testsuite/ltrace.main/main-vfork.exp
+new file mode 100644
+index 0000000..299c5e0
+--- /dev/null
++++ b/testsuite/ltrace.main/main-vfork.exp
+@@ -0,0 +1,39 @@
++# This file was written by Yao Qi <qiyao@cn.ibm.com>.
++
++set testfile "main-vfork"
++set srcfile ${testfile}.c
++set binfile ${testfile}
++set libfile "main-lib"
++set libsrc $srcdir/$subdir/$libfile.c
++set lib_sl $objdir/$subdir/lib$testfile.so
++
++
++if [get_compiler_info $binfile] {
++  return -1
++}
++
++verbose "compiling source file now....."
++if { [ltrace_compile_shlib $libsrc $lib_sl debug ] != "" 
++  || [ltrace_compile $srcdir/$subdir/$srcfile $objdir/$subdir/$binfile executable [list debug shlib=$lib_sl] ] != ""} {
++  send_user "Testcase compile failed, so all tests in this file will automatically fail.\n"
++}
++
++# set options for ltrace.
++ltrace_options "-f"
++
++# Run PUT for ltarce.
++set exec_output [ltrace_runtest $objdir/$subdir $objdir/$subdir/$binfile]
++
++# Check the output of this program.
++verbose "ltrace runtest output: $exec_output\n"
++if [regexp {ELF from incompatible architecture} $exec_output] {
++	fail "32-bit ltrace can not perform on 64-bit PUTs and rebuild ltrace in 64 bit mode!"
++	return 
++} elseif [ regexp {Couldn't get .hash data} $exec_output ] {
++	fail "Couldn't get .hash data!"
++	return
++}
++
++# Verify the output by checking numbers of print in main-vfork.ltrace.
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "print" 20
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "'vfork resumed'" 2
+diff --git a/testsuite/ltrace.torture/vfork-thread.c b/testsuite/ltrace.torture/vfork-thread.c
+new file mode 100644
+index 0000000..f909bd3
+--- /dev/null
++++ b/testsuite/ltrace.torture/vfork-thread.c
+@@ -0,0 +1,50 @@
++#include <pthread.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <stdio.h>
++
++
++void *
++routine (void *data)
++{
++  int i;
++  for (i = 0; i < 6; ++i)
++    {
++      puts ("bleble");
++      sleep (1);
++    }
++}
++
++
++void *
++routine2 (void *data)
++{
++  pid_t child = vfork ();
++  if (child == 0)
++    {
++      int i, j;
++      puts ("vforked");
++      for (i = 0; i < 100000; ++i)
++	for (j = 0; j < 10000; ++j)
++	  ;
++      puts ("vforked child exiting");
++      _exit (0);
++    }
++  puts ("parent continuing");
++  return NULL;
++}
++
++int
++main(int argc, char *argv[])
++{
++  pthread_t thread;
++  pthread_create (&thread, NULL, &routine, NULL);
++
++  sleep (1);
++
++  pthread_t thread2;
++  pthread_create (&thread2, NULL, &routine2, NULL);
++  pthread_join (thread2, NULL);
++  pthread_join (thread, NULL);
++  return 0;
++}
+diff --git a/testsuite/ltrace.torture/vfork-thread.exp b/testsuite/ltrace.torture/vfork-thread.exp
+new file mode 100644
+index 0000000..bd01319
+--- /dev/null
++++ b/testsuite/ltrace.torture/vfork-thread.exp
+@@ -0,0 +1,32 @@
++# This file was written by Yao Qi <qiyao@cn.ibm.com>.
++
++set testfile "vfork-thread"
++set srcfile ${testfile}.c
++set binfile ${testfile}
++
++
++verbose "compiling source file now....."
++# Build the shared libraries this test case needs.
++if  { [ ltrace_compile "${srcdir}/${subdir}/${testfile}.c" "${objdir}/${subdir}/${binfile}" executable [list debug ldflags=-pthread] ] != "" } {
++     send_user "Testcase compile failed, so all tests in this file will automatically fail\n."
++}
++
++ltrace_options "-f"
++
++# Run PUT for ltarce.
++set exec_output [ltrace_runtest $objdir/$subdir $objdir/$subdir/$binfile]
++
++# Check the output of this program.
++verbose "ltrace runtest output: $exec_output\n"
++if [regexp {ELF from incompatible architecture} $exec_output] {
++	fail "32-bit ltrace can not perform on 64-bit PUTs and rebuild ltrace in 64 bit mode!"
++	return
++} elseif [ regexp {Couldn't get .hash data} $exec_output ] {
++	fail "Couldn't get .hash data!"
++	return
++}
++
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "puts" 9
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "sleep" 7
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "vfork resumed" 2
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "_exit" 1

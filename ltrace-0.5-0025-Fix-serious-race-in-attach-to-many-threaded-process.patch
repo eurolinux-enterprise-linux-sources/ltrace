@@ -1,0 +1,278 @@
+diff -urp ltrace-0.5/breakpoints.c ltrace-0.5-pm/breakpoints.c
+--- ltrace-0.5/breakpoints.c	2011-08-19 19:04:52.990754040 +0200
++++ ltrace-0.5-pm/breakpoints.c	2011-08-19 19:08:35.783294467 +0200
+@@ -151,7 +151,7 @@ static void free_bp_cb(void *addr, void 
+ 	free(sbp);
+ }
+ 
+-void
++int
+ breakpoints_init(struct process *proc, int enable)
+ {
+ 	struct library_symbol *sym;
+@@ -183,6 +183,11 @@ breakpoints_init(struct process *proc, i
+ 
+ 	if (opt_L && proc->filename) {
+ 		proc->list_of_symbols = read_elf(proc);
++		if (proc->list_of_symbols == NULL) {
++			/* XXX leak breakpoints */
++			return -1;
++		}
++
+ 		if (opt_e) {
+ 			struct library_symbol **tmp1 = &proc->list_of_symbols;
+ 			while (*tmp1) {
+@@ -209,6 +214,7 @@ breakpoints_init(struct process *proc, i
+ 	proc->callstack_depth = 0;
+ 	proc->breakpoints_enabled = -1;
+ 	proc->old = 0;
++	return 0;
+ }
+ 
+ void reinitialize_breakpoints(struct process *proc)
+Только в ltrace-0.5-pm: breakpoints.c~
+diff -urp ltrace-0.5/elf.c ltrace-0.5-pm/elf.c
+--- ltrace-0.5/elf.c	2011-08-19 19:04:52.925749555 +0200
++++ ltrace-0.5-pm/elf.c	2011-08-19 19:10:58.128221761 +0200
+@@ -17,7 +17,7 @@
+ #include "debug.h"
+ #include "options.h"
+ 
+-static void do_init_elf(struct ltelf *lte, const char *filename);
++static int do_init_elf(struct ltelf *lte, const char *filename);
+ static void do_close_elf(struct ltelf *lte);
+ static void add_library_symbol(GElf_Addr addr, const char *name,
+ 			       struct library_symbol **library_symbolspp,
+@@ -181,7 +181,7 @@ open_elf(struct ltelf *lte, const char *
+ 
+ }
+ 
+-static void do_init_elf(struct ltelf *lte, const char *filename)
++static int do_init_elf(struct ltelf *lte, const char *filename)
+ {
+ 	int i;
+ 	GElf_Addr relplt_addr = 0;
+@@ -290,6 +290,7 @@ static void do_init_elf(struct ltelf *lt
+ 
+ 		debug(1, "%s %zd PLT relocations", filename, lte->relplt_count);
+ 	}
++	return 0;
+ }
+ 
+ static void do_close_elf(struct ltelf *lte)
+@@ -443,10 +444,13 @@ struct library_symbol *read_elf(struct p
+ 
+ 	memset(lte, 0, sizeof(lte));
+ 
+-	do_init_elf(lte, proc->filename);
++	if (do_init_elf(lte, proc->filename))
++		return NULL;
+ 	proc->e_machine = lte->ehdr.e_machine;
+ 	for (i = 0; i < library_num; ++i)
+-		do_init_elf(&lte[i + 1], library[i]);
++		if (do_init_elf(&lte[i + 1], library[i]))
++			error(EXIT_FAILURE, errno, "Can't open \"%s\"",
++			      library[i]);
+ 
+ 	for (i = 0; i < lte->relplt_count; ++i) {
+ 		GElf_Rel rel;
+--- ltrace-0.5/elf.c~	2011-09-21 18:07:55.799202311 +0200
++++ ltrace-0.5/elf.c	2011-09-21 18:08:18.432202992 +0200
+@@ -34,7 +34,7 @@ open_elf(struct ltelf *lte, const char *
+ {
+ 	lte->fd = open(filename, O_RDONLY);
+ 	if (lte->fd == -1)
+-		error(EXIT_FAILURE, errno, "Can't open \"%s\"", filename);
++		return 1;
+ 
+ 	elf_version(EV_CURRENT);
+ 
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-08-19 19:04:53.030756829 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-08-19 19:08:50.208300121 +0200
+@@ -239,7 +239,7 @@ extern pid_t execute_program(const char 
+ extern int display_arg(enum tof type, struct process *proc, int arg_num,
+ 		       enum arg_type at);
+ extern struct breakpoint *address2bpstruct(struct process *proc, void *addr);
+-extern void breakpoints_init(struct process *proc, int enable);
++extern int breakpoints_init(struct process *proc, int enable);
+ extern void insert_breakpoint(struct process *proc, void *addr,
+ 			      struct library_symbol *libsym, int enable);
+ extern void delete_breakpoint(struct process *proc, void *addr);
+Только в ltrace-0.5-pm: ltrace.h~
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2011-08-19 19:04:53.063759139 +0200
++++ ltrace-0.5-pm/proc.c	2011-08-19 19:14:32.257151895 +0200
+@@ -9,6 +9,7 @@
+ #include <stdlib.h>
+ #include <assert.h>
+ #include <unistd.h>
++#include <error.h>
+ 
+ #include "ltrace.h"
+ #include "options.h"
+@@ -24,14 +25,24 @@ open_program(char *filename, pid_t pid, 
+ 		perror("malloc");
+ 		exit(1);
+ 	}
++
+ 	proc->filename = strdup(filename);
+ 	proc->breakpoints_enabled = -1;
+ 	proc->pid = pid;
+ 
+ 	add_process(proc);
+-	assert(proc->leader != NULL);
++	if (proc->leader == NULL) {
++		free(proc);
++		return NULL;
++	}
++
+ 	if (proc->leader == proc)
+-		breakpoints_init(proc, enable);
++		if (breakpoints_init(proc, enable)) {
++			fprintf(stderr, "failed to init breakpoints %d\n",
++				proc->pid);
++			remove_process(proc);
++			return NULL;
++		}
+ 
+ 	return proc;
+ }
+@@ -42,19 +53,28 @@ open_one_pid(pid_t pid)
+ 	struct process *proc;
+ 	char *filename;
+ 
+-	if (trace_pid(pid) < 0)
+-		return 0;
+-
+-	filename = pid2name(pid);
+-	if (filename == NULL)
+-		return 0;
++	/* Get the filename first.  Should the trace_pid fail, we can
++	 * easily free it, untracing is more work.  */
++	if ((filename = pid2name(pid)) == NULL
++	    || trace_pid(pid) < 0) {
++		free(filename);
++		return -1;
++	}
+ 
+-	proc = open_program(filename, pid, 1);
++	proc = open_program(filename, pid, 0);
++	if (proc == NULL)
++		return -1;
+ 	trace_set_options(proc, pid);
+-	continue_process(pid);
+-	proc->breakpoints_enabled = 1;
+ 
+-	return 1;
++	return 0;
++}
++
++enum pcb_status
++start_one_pid(struct process * proc, void * data)
++{
++	continue_process(proc->pid);
++	proc->breakpoints_enabled = 1;
++	return pcb_cont;
+ }
+ 
+ void
+@@ -66,7 +86,7 @@ open_pid(pid_t pid, int verbose)
+ 		return;
+ 
+ 	/* First, see if we can attach the requested PID itself.  */
+-	if (!open_one_pid(pid)) {
++	if (open_one_pid(pid)) {
+ 		fprintf(stderr, "Cannot attach to pid %u: %s\n",
+ 			pid, strerror(errno));
+ 		return;
+@@ -81,26 +101,40 @@ open_pid(pid_t pid, int verbose)
+ 	 * reach a point where process_tasks doesn't give any new
+ 	 * processes (because there's nobody left to produce
+ 	 * them).  */
++	size_t old_ntasks = 0;
+ 	int have_all;
+-	do {
++	while (1) {
+ 		pid_t *tasks;
+ 		size_t ntasks;
+ 		size_t i;
++
+ 		if (process_tasks(pid, &tasks, &ntasks) < 0) {
+ 			fprintf(stderr, "Cannot obtain tasks of pid %u: %s\n",
+ 				pid, strerror(errno));
+-			return;
++			goto start;
+ 		}
+ 
+ 		have_all = 1;
+ 		for (i = 0; i < ntasks; ++i)
+ 			if (pid2proc(tasks[i]) == NULL
+-			    && !open_one_pid(tasks[i]))
++			    && open_one_pid(tasks[i]))
+ 				have_all = 0;
+ 
+ 		free(tasks);
+ 
+-	} while (have_all == 0);
++		if (have_all && old_ntasks == ntasks)
++			break;
++		old_ntasks = ntasks;
++	}
++
++	/* Done.  Now initialize breakpoints and then continue
++	 * everyone.  */
++	struct process * leader;
++start:
++	leader = pid2proc(pid)->leader;
++	enable_all_breakpoints(leader);
++
++	each_task(pid2proc(pid)->leader, start_one_pid, NULL);
+ }
+ 
+ void open_forked_pid(pid_t pid, int early)
+@@ -156,13 +190,16 @@ add_process(struct process * proc)
+ 	struct process ** leaderp = &list_of_processes;
+ 	if (proc->pid) {
+ 		pid_t tgid = process_leader(proc->pid);
++		if (tgid == 0)
++			/* Must have been terminated before we managed
++			 * to fully attach.  */
++			return;
+ 		if (tgid == proc->pid)
+ 			proc->leader = proc;
+ 		else {
+ 			struct process * leader = pid2proc(tgid);
+ 			proc->leader = leader;
+ 			if (leader != NULL)
+-				// NULL: sub-task added before leader?
+ 				leaderp = &leader->next;
+ 		}
+ 	}
+Только в ltrace-0.5-pm: proc.c~
+diff -urp ltrace-0.5/sysdeps/linux-gnu/proc.c ltrace-0.5-pm/sysdeps/linux-gnu/proc.c
+--- ltrace-0.5/sysdeps/linux-gnu/proc.c	2011-08-19 19:04:53.046757949 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/proc.c	2011-08-19 19:14:45.898102785 +0200
+@@ -102,7 +102,7 @@ process_leader_cb(const char * line, con
+ pid_t
+ process_leader(pid_t pid)
+ {
+-	pid_t tgid = pid;
++	pid_t tgid = 0;
+ 	FILE * file = open_status_file(pid);
+ 	if (file != NULL) {
+ 		each_line_starting(file, "Tgid:\t", &process_leader_cb, &tgid);
+Только в ltrace-0.5-pm/sysdeps/linux-gnu: proc.c~
+diff -urp ltrace-0.5/sysdeps/linux-gnu/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/trace.c	2011-08-19 19:04:53.059758859 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/trace.c	2011-08-19 19:15:30.482211362 +0200
+@@ -98,8 +98,6 @@ have_events_for(pid_t pid)
+ void
+ continue_process(pid_t pid)
+ {
+-	//printf("continue_process %d\n", pid);
+-
+ 	/* Only really continue the process if there are no events in
+ 	   the queue for this process.  Otherwise just for the other
+ 	   events to arrive.  */
+Только в ltrace-0.5-pm/sysdeps/linux-gnu: trace.c~

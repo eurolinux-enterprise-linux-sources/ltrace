@@ -1,0 +1,15 @@
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-08-04 22:25:39.446337263 +0200
++++ ltrace-0.5-pm/process_event.c	2011-08-04 22:28:13.925116061 +0200
+@@ -112,6 +112,10 @@ static void process_clone(struct event *
+ 	p->pid = event->e_un.newpid;
+ 	p->parent = event->proc;
+ 
++	/* We save register values to the arch pointer, and these need
++	   to be per-thread.  */
++	p->arch_ptr = NULL;
++
+ 	if (pending_new(p->pid)) {
+ 		pending_new_remove(p->pid);
+ 		if (p->event_handler != NULL)
+Только в ltrace-0.5-pm: process_event.c~

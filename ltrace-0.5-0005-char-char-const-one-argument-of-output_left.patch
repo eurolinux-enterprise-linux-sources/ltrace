@@ -1,0 +1,35 @@
+diff -urp ltrace-0.5/output.c ltrace-0.5-pm/output.c
+--- ltrace-0.5/output.c	2011-07-28 16:48:32.512249064 +0200
++++ ltrace-0.5-pm/output.c	2011-07-28 16:48:30.424141067 +0200
+@@ -104,7 +104,8 @@ static void begin_of_line(enum tof type,
+ 	}
+ }
+ 
+-static struct function *name2func(char *name)
++static struct function *
++name2func(char const *name)
+ {
+ 	struct function *tmp;
+ 	const char *str1, *str2;
+@@ -161,7 +162,8 @@ static void tabto(int col)
+ 	}
+ }
+ 
+-void output_left(enum tof type, struct process *proc, char *function_name)
++void
++output_left(enum tof type, struct process *proc, char const *function_name)
+ {
+ 	struct function *func;
+ 
+Только в ltrace-0.5-pm: output.c~
+diff -urp ltrace-0.5/output.h ltrace-0.5-pm/output.h
+--- ltrace-0.5/output.h	2006-02-20 22:48:07.000000000 +0100
++++ ltrace-0.5-pm/output.h	2011-07-28 16:48:30.411140402 +0200
+@@ -4,5 +4,6 @@
+ 
+ void output_line(struct process *proc, char *fmt, ...);
+ 
+-void output_left(enum tof type, struct process *proc, char *function_name);
++void output_left(enum tof type, struct process *proc,
++		 char const *function_name);
+ void output_right(enum tof type, struct process *proc, char *function_name);

@@ -1,0 +1,14 @@
+diff -up ltrace-0.5/wait_for_something.c\~ ltrace-0.5/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c~	2012-04-11 20:11:39.366642110 +0200
++++ ltrace-0.5/wait_for_something.c	2012-04-11 21:40:16.459491258 +0200
+@@ -339,7 +339,7 @@ struct event *wait_for_something(void)
+ 		  ? event.proc->instruction_pointer
+ 		  : (event.proc->instruction_pointer = get_instruction_pointer (event.proc));
+ 
+-		if (address2bpstruct(leader, addr))
++		if (address2bpstruct(leader, addr - DECR_PC_AFTER_BREAK))
+ 			stop_signal = SIGTRAP;
+ 	}
+ 
+
+Diff finished.  Wed Apr 11 21:40:36 2012

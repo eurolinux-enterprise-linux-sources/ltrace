@@ -1,0 +1,18 @@
+diff -up ltrace-0.5/summary.c\~ ltrace-0.5/summary.c
+--- ltrace-0.5/summary.c~	2012-02-22 17:34:56.999207722 +0100
++++ ltrace-0.5/summary.c	2012-02-22 17:38:51.316213072 +0100
+@@ -84,7 +84,11 @@ void show_summary(void)
+ 		       (int)entries[i].tv.tv_sec, (int)entries[i].tv.tv_usec,
+ 		       (unsigned long int)(c / entries[i].count),
+ 		       entries[i].count,
+-		       opt_C ? my_demangle(entries[i].name) : entries[i].name);
++#ifdef USE_DEMANGLE
++			opt_C ? my_demangle(entries[i].name) :
++#endif
++			entries[i].name
++			);
+ 	}
+ 	fprintf(output,
+ 	    "------ ----------- ----------- --------- --------------------\n");
+
+Diff finished.  Wed Feb 22 17:38:56 2012

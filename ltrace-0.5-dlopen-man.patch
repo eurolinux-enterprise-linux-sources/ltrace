@@ -1,0 +1,14 @@
+diff -up ltrace-0.5/ltrace.1\~ ltrace-0.5/ltrace.1
+--- ltrace-0.5/ltrace.1~	2012-03-23 12:27:14.841993107 +0100
++++ ltrace-0.5/ltrace.1	2012-03-23 12:39:14.196682620 +0100
+@@ -157,8 +157,6 @@ Manual page and documentation are not ve
+ Option -f sometimes fails to trace some children.
+ .LP
+ It only works on Linux and in a small subset of architectures.
+-.LP
+-Calls to dlopen()ed libraries will not be traced.
+ .PP
+ If you like to report a bug, send a notice to the author, or use the
+ .BR reportbug(1)
+
+Diff finished.  Fri Mar 23 12:39:19 2012

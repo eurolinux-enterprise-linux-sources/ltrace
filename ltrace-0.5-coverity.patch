@@ -1,0 +1,43 @@
+diff -up ltrace-0.5/sysdeps/linux-gnu/proc.c\~ ltrace-0.5/sysdeps/linux-gnu/proc.c
+--- ltrace-0.5/sysdeps/linux-gnu/proc.c~	2012-03-20 20:57:06.539453240 +0100
++++ ltrace-0.5/sysdeps/linux-gnu/proc.c	2012-03-20 21:01:57.698109777 +0100
+@@ -218,6 +218,8 @@ process_tasks(pid_t pid, pid_t **ret_tas
+ 		struct dirent entry;
+ 		struct dirent *result;
+ 		if (readdir_r(d, &entry, &result) != 0) {
++		fail:
++			closedir(d);
+ 			free(tasks);
+ 			return -1;
+ 		}
+@@ -229,10 +231,8 @@ process_tasks(pid_t pid, pid_t **ret_tas
+ 				alloc = alloc > 0 ? (2 * alloc) : 8;
+ 				pid_t *ntasks = realloc(tasks,
+ 							sizeof(*tasks) * alloc);
+-				if (ntasks == NULL) {
+-					free(tasks);
+-					return -1;
+-				}
++				if (ntasks == NULL)
++					goto fail;
+ 				tasks = ntasks;
+ 			}
+ 			if (n >= alloc)
+diff -up ltrace-0.5/process_event.c\~ ltrace-0.5/process_event.c
+--- ltrace-0.5/process_event.c~	2012-03-20 20:57:06.529452942 +0100
++++ ltrace-0.5/process_event.c	2012-03-20 21:04:08.541999940 +0100
+@@ -101,12 +101,13 @@ static void pending_new_remove(pid_t pid
+ 		free(p);
+ 	} else {
+ 		while (p) {
++			Pending_New *next = p->next;
+ 			if (p->pid == pid) {
+ 				pred->next = p->next;
+ 				free(p);
+ 			}
+ 			pred = p;
+-			p = p->next;
++			p = next;
+ 		}
+ 	}
+ }

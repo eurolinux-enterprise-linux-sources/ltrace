@@ -1,0 +1,646 @@
+diff -urp ltrace-0.5/breakpoints.c ltrace-0.5-pm/breakpoints.c
+--- ltrace-0.5/breakpoints.c	2011-07-28 19:42:52.543644899 +0200
++++ ltrace-0.5-pm/breakpoints.c	2011-07-28 21:01:01.847841739 +0200
+@@ -22,6 +22,7 @@ struct breakpoint *address2bpstruct(stru
+ {
+ 	assert(proc != NULL);
+ 	assert(proc->breakpoints != NULL);
++	assert(proc->leader == proc);
+ 	if (!proc->breakpoints) {
+ 		proc->breakpoints =
+ 		  dict_init(dict_key2hash_int, dict_key_cmp_int);
+@@ -36,6 +37,13 @@ insert_breakpoint(struct process *proc, 
+ 	struct breakpoint *sbp;
+ 	debug(1, "insert_breakpoint(symbol=%s, addr=%p)", libsym?libsym->name:"(nil)", addr);
+ 
++	struct process * leader = proc->leader;
++
++	/* Only the group leader should be getting the breakpoints and
++	 * thus have ->breakpoint initialized.  */
++	assert(leader != NULL);
++	assert(leader->breakpoints != NULL);
++
+ 	if (!proc->breakpoints) {
+ 		proc->breakpoints =
+ 		    dict_init(dict_key2hash_int, dict_key_cmp_int);
+@@ -47,13 +55,13 @@ insert_breakpoint(struct process *proc, 
+ 	if (libsym)
+ 		libsym->needs_init = 0;
+ 
+-	sbp = dict_find_entry(proc->breakpoints, addr);
++	sbp = dict_find_entry(leader->breakpoints, addr);
+ 	if (!sbp) {
+ 		sbp = calloc(1, sizeof(struct breakpoint));
+ 		if (!sbp) {
+ 			return;	/* TODO FIXME XXX: error_mem */
+ 		}
+-		dict_enter(proc->breakpoints, addr, sbp);
++		dict_enter(leader->breakpoints, addr, sbp);
+ 		sbp->addr = addr;
+ 		sbp->libsym = libsym;
+ 		if (libsym)
+@@ -66,7 +74,10 @@ insert_breakpoint(struct process *proc, 
+ 
+ void delete_breakpoint(struct process *proc, void *addr)
+ {
+-	struct breakpoint *sbp = dict_find_entry(proc->breakpoints, addr);
++	struct process * leader = proc->leader;
++	assert(leader != NULL);
++
++	struct breakpoint *sbp = dict_find_entry(leader->breakpoints, addr);
+ 	assert(sbp);		/* FIXME: remove after debugging has been done. */
+ 	/* This should only happen on out-of-memory conditions. */
+ 	if (sbp == NULL)
+@@ -126,6 +137,7 @@ static void disable_bp_cb(void *addr, vo
+ 
+ void disable_all_breakpoints(struct process *proc)
+ {
++	assert(proc->leader == proc);
+ 	if (proc->breakpoints_enabled) {
+ 		debug(1, "Disabling breakpoints for pid %u...", proc->pid);
+ 		dict_apply_to_all(proc->breakpoints, disable_bp_cb, proc);
+@@ -151,6 +163,11 @@ breakpoints_init(struct process *proc, i
+ 		proc->breakpoints = NULL;
+ 	}
+ 
++	/* Only the thread group leader should hold the breakpoints.
++	 * (N.B. PID may be set to 0 temporarily when called by
++	 * handle_exec).  */
++	assert(proc->leader == proc);
++
+ 	proc->breakpoints = dict_init(dict_key2hash_int,
+ 				      dict_key_cmp_int);
+ 
+Только в ltrace-0.5-pm: breakpoints.c~
+diff -urp ltrace-0.5/ltrace.c ltrace-0.5-pm/ltrace.c
+--- ltrace-0.5/ltrace.c	2011-07-28 19:42:52.555645391 +0200
++++ ltrace-0.5-pm/ltrace.c	2011-07-28 21:01:38.310198797 +0200
+@@ -38,7 +38,7 @@ stop_non_p_processes (struct process * p
+ 			printf("stop_non_p_processes: %d terminated?\n", it->pid);
+ 			continue;
+ 		}
+-		if (p_proc == proc) {
++		if (p_proc == proc || p_proc->leader == proc->leader) {
+ 			stop = 0;
+ 			break;
+ 		}
+Только в ltrace-0.5-pm: ltrace.c~
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-07-28 19:42:52.557645474 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 21:01:13.094260846 +0200
+@@ -106,12 +106,21 @@ enum Process_State {
+ 	STATE_IGNORED  /* ignore this process (it's a fork and no -f was used) */
+ };
+ 
++/* XXX We would rather have this all organized a little differently,
++ * have Process for the whole group and Task for what's there for
++ * per-thread stuff.  But for now this is the less invasive way of
++ * structuring it.  */
+ struct process {
+ 	Process_State state;
+ 	struct process *parent; /* needed by STATE_BEING_CREATED */
+ 	char *filename;
+ 	pid_t pid;
++
++	/* Dictionary of breakpoints (which is a mapping
++	 * address->struct breakpoint).  This is NULL for non-leader
++	 * processes.  */
+ 	struct dict *breakpoints;
++
+ 	int breakpoints_enabled;	/* -1:not enabled yet, 0:disabled, 1:enabled */
+ 	int mask_32bit;		/* 1 if 64-bit ltrace is tracing 32-bit process.  */
+ 	unsigned int personality;
+@@ -134,7 +143,18 @@ struct process {
+ 	short e_machine;
+ 	short need_to_reinitialize_breakpoints;
+ 
++	/**
++	 * Process chaining.
++	 **/
+ 	struct process *next;
++
++	/* LEADER points to the leader thread of the POSIX.1 process.
++	   If X->LEADER == X, then X is the leader thread and the
++	   Process structures chained by NEXT represent other threads,
++	   up until, but not including, the next leader thread.
++	   LEADER may be NULL after the leader has already exited.  In
++	   that case this process is waiting to be collected.  */
++	struct process *leader;
+ };
+ 
+ struct event {
+@@ -196,6 +216,10 @@ extern void show_summary(void);
+ 
+ /* Arch-dependent stuff: */
+ extern char *pid2name(pid_t pid);
++extern pid_t process_leader(pid_t pid);
++extern int process_tasks(pid_t pid, pid_t **ret_tasks, size_t *ret_n);
++extern int process_stopped(pid_t pid);
++extern char process_status(pid_t pid);
+ extern void trace_set_options(struct process *proc, pid_t pid);
+ extern void trace_me(void);
+ extern int trace_pid(pid_t pid);
+@@ -219,6 +243,7 @@ extern void save_register_args(enum tof 
+ extern int umovestr(struct process *proc, void *addr, int len, void *laddr);
+ extern int ffcheck(void *maddr);
+ extern void *sym2addr(struct process *, struct library_symbol *);
++extern int task_kill (pid_t pid, int sig);
+ extern struct process *pid2proc(int pid);
+ extern void add_process(struct process * proc);
+ extern void remove_process(struct process * proc);
+@@ -226,6 +251,11 @@ extern struct process *each_process(stru
+ 				    enum pcb_status (* cb)(struct process *,
+ 							   void * data),
+ 				    void * data);
++extern struct process *each_task(struct process * start,
++				 enum pcb_status (* cb)(struct process * proc,
++							void * data),
++				 void * data);
++
+ 
+ #if 0				/* not yet */
+ extern int umoven(struct process *proc, void *addr, int len, void *laddr);
+Только в ltrace-0.5-pm: ltrace.h~
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2011-07-28 19:42:52.559645555 +0200
++++ ltrace-0.5-pm/proc.c	2011-07-28 21:01:52.703733336 +0200
+@@ -28,12 +28,15 @@ open_program(char *filename, pid_t pid, 
+ 	proc->pid = pid;
+ 
+ 	add_process(proc);
+-	breakpoints_init(proc, enable);
++	assert(proc->leader != NULL);
++	if (proc->leader == proc)
++		breakpoints_init(proc, enable);
+ 
+ 	return proc;
+ }
+ 
+-void open_pid(pid_t pid, int verbose)
++static void
++open_one_pid(pid_t pid)
+ {
+ 	struct process *proc;
+ 	char *filename;
+@@ -60,6 +63,30 @@ void open_pid(pid_t pid, int verbose)
+ 	proc->breakpoints_enabled = 1;
+ }
+ 
++void
++open_pid(pid_t pid, int verbose)
++{
++	pid_t *tasks;
++	size_t ntasks;
++	int should_free = 1;
++	if (process_tasks(pid, &tasks, &ntasks) < 0) {
++		fprintf(stderr, "Cannot obtain tasks of pid %u: %s\n", pid,
++			strerror(errno));
++
++		// Attach at least this one.
++		tasks = &pid;
++		ntasks = 1;
++		should_free = 0;
++	}
++
++	size_t i;
++	for (i = 0; i < ntasks; ++i)
++		open_one_pid(tasks[i]);
++
++	if (should_free)
++		free(tasks);
++}
++
+ void open_forked_pid(pid_t pid, int early)
+ {
+ 	char *filename = pid2name(pid);
+@@ -88,11 +115,50 @@ each_process(struct process * proc,
+ 	}
+ 	return NULL;
+ }
++
++struct process *
++each_task(struct process * it,
++	  enum pcb_status (* cb)(struct process * proc, void * data),
++	  void * data)
++{
++	if (it != NULL) {
++		struct process * leader = it->leader;
++		for (; it != NULL && it->leader == leader; ) {
++			/* Callback might call remove_process.  */
++			struct process * next = it->next;
++			if ((*cb) (it, data) == pcb_stop)
++				return it;
++			it = next;
++		}
++	}
++	return NULL;
++}
++
+ void
+ add_process(struct process * proc)
+ {
+-	proc->next = list_of_processes;
+-	list_of_processes = proc;
++	struct process ** leaderp = &list_of_processes;
++	if (proc->pid) {
++		pid_t tgid = process_leader(proc->pid);
++		if (tgid == proc->pid)
++			proc->leader = proc;
++		else {
++			struct process * leader = pid2proc(tgid);
++			proc->leader = leader;
++			if (leader != NULL)
++				// NULL: sub-task added before leader?
++				leaderp = &leader->next;
++		}
++	}
++	proc->next = *leaderp;
++	*leaderp = proc;
++}
++
++static enum pcb_status
++clear_leader(struct process * proc, void * data)
++{
++	proc->leader = NULL;
++	return pcb_cont;
+ }
+ 
+ void
+@@ -100,6 +168,9 @@ remove_process(struct process *proc)
+ {
+ 	struct process *tmp, *tmp2;
+ 
++	if (proc->leader == proc)
++		each_task(proc, &clear_leader, NULL);
++
+ 	if (list_of_processes == proc) {
+ 		tmp = list_of_processes;
+ 		list_of_processes = list_of_processes->next;
+Только в ltrace-0.5-pm: proc.c~
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-07-28 19:42:52.560645596 +0200
++++ ltrace-0.5-pm/process_event.c	2011-07-28 21:01:30.382903501 +0200
+@@ -370,13 +370,20 @@ static void process_breakpoint(struct ev
+ {
+ 	int i, j;
+ 	struct breakpoint *sbp, *nxtbp;
++	struct process *leader = event->proc->leader;
++
++	/* The leader has terminated.  */
++	if (leader == NULL) {
++		continue_process(event->proc->pid);
++		return;
++	}
+ 
+ 	debug(2, "event: breakpoint (%p)", event->e_un.brk_addr);
+ 	if ((sbp = event->proc->breakpoint_being_enabled) != 0) {
+ #ifdef __powerpc__
+ 		char nop_inst[] = PPC_NOP;
+                 if (memcmp(sbp->orig_value, nop_inst, PPC_NOP_LENGTH) == 0) {
+-                	nxtbp = address2bpstruct(event->proc,
++                	nxtbp = address2bpstruct(leader,
+                                                  event->e_un.brk_addr +
+                                                  	PPC_NOP_LENGTH);
+ 			if (nxtbp != 0) {
+@@ -405,12 +412,12 @@ static void process_breakpoint(struct ev
+ 			unsigned long a;
+ 			struct library_symbol *libsym =
+ 			    event->proc->callstack[i].c_un.libfunc;
+-			void *addr = sym2addr(event->proc, libsym);
++			void *addr = sym2addr(leader, libsym);
+ 
+ 			if (libsym->plt_type != LS_TOPLT_POINT) {
+ 				unsigned char break_insn[] = BREAKPOINT_VALUE;
+ 
+-				sbp = address2bpstruct(event->proc, addr);
++				sbp = address2bpstruct(leader, addr);
+ 				assert(sbp);
+ 				a = ptrace(PTRACE_PEEKTEXT, event->proc->pid,
+ 					   addr);
+@@ -443,14 +450,18 @@ static void process_breakpoint(struct ev
+ 				output_right(LT_TOF_FUNCTIONR, event->proc,
+ 					     event->proc->callstack[i].c_un.libfunc->name);
+ 			}
+-			continue_after_breakpoint(event->proc,
+-						  address2bpstruct(event->proc,
+-								   event->e_un.brk_addr));
++			sbp = address2bpstruct(leader, event->e_un.brk_addr);
++			continue_after_breakpoint(event->proc, sbp);
+ 			return;
+ 		}
+ 	}
+ 
+-	if ((sbp = address2bpstruct(event->proc, event->e_un.brk_addr))) {
++	if ((sbp = address2bpstruct(leader, event->e_un.brk_addr))) {
++		if (sbp->libsym == NULL) {
++			continue_after_breakpoint(event->proc, sbp);
++			return;
++		}
++
+ 		if (event->proc->state != STATE_IGNORED) {
+ 			event->proc->stack_pointer = get_stack_pointer(event->proc);
+ 			event->proc->return_addr =
+@@ -462,7 +473,7 @@ static void process_breakpoint(struct ev
+ 		if (event->proc->need_to_reinitialize_breakpoints
+ 		    && (strcmp(sbp->libsym->name, PLTs_initialized_by_here) ==
+ 			0))
+-			reinitialize_breakpoints(event->proc);
++			reinitialize_breakpoints(leader);
+ #endif
+ 
+ 		continue_after_breakpoint(event->proc, sbp);
+@@ -532,6 +543,7 @@ static void callstack_pop(struct process
+ 
+ 	elem = &proc->callstack[proc->callstack_depth - 1];
+ 	if (!elem->is_syscall && elem->return_addr) {
++		assert(proc->leader != NULL);
+ 		delete_breakpoint(proc, elem->return_addr);
+ 	}
+ 	proc->callstack_depth--;
+diff -urp ltrace-0.5/sysdeps/linux-gnu/proc.c ltrace-0.5-pm/sysdeps/linux-gnu/proc.c
+--- ltrace-0.5/sysdeps/linux-gnu/proc.c	2006-02-20 22:48:07.000000000 +0100
++++ ltrace-0.5-pm/sysdeps/linux-gnu/proc.c	2011-07-28 21:02:14.847557475 +0200
+@@ -3,10 +3,18 @@
+ #endif
+ 
+ #include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <signal.h>
+ #include <unistd.h>
++#include <dirent.h>
++#include <ctype.h>
++#include <errno.h>
++#include <sys/syscall.h>
++#include "ltrace.h"
++#include <stdlib.h>
+ 
+ /* /proc/pid doesn't exist just after the fork, and sometimes `ltrace'
+  * couldn't open it to find the executable.  So it may be necessary to
+@@ -15,17 +21,19 @@
+ 
+ #define	MAX_DELAY	100000	/* 100000 microseconds = 0.1 seconds */
+ 
++#define PROC_PID_FILE(VAR, FORMAT, PID)		\
++	char VAR[strlen(FORMAT) + 6];		\
++	sprintf(VAR, FORMAT, PID)
++
+ /*
+  * Returns a file name corresponding to a running pid
+  */
+ char *pid2name(pid_t pid)
+ {
+-	char proc_exe[1024];
+-
+ 	if (!kill(pid, 0)) {
+ 		int delay = 0;
+ 
+-		sprintf(proc_exe, "/proc/%d/exe", pid);
++		PROC_PID_FILE(proc_exe, "/proc/%d/exe", pid);
+ 
+ 		while (delay < MAX_DELAY) {
+ 			if (!access(proc_exe, F_OK)) {
+@@ -36,3 +44,175 @@ char *pid2name(pid_t pid)
+ 	}
+ 	return NULL;
+ }
++
++static FILE *
++open_status_file(pid_t pid)
++{
++	PROC_PID_FILE(fn, "/proc/%d/status", pid);
++	/* Don't complain if we fail.  This would typically happen
++	   when the process is about to terminate, and these files are
++	   not available anymore.  This function is called from the
++	   event loop, and we don't want to clutter the output just
++	   because the process terminates.  */
++	return fopen(fn, "r");
++}
++
++static char *
++find_line_starting(FILE * file, const char * prefix, size_t len)
++{
++	char * line = NULL;
++	size_t line_len = 0;
++	while (!feof(file)) {
++		if (getline(&line, &line_len, file) < 0)
++			return NULL;
++		if (strncmp(line, prefix, len) == 0)
++			return line;
++	}
++	return NULL;
++}
++
++static void
++each_line_starting(FILE * file, const char *prefix,
++		   enum pcb_status (*cb)(const char * line, const char * prefix,
++					 void * data),
++		   void * data)
++{
++	size_t len = strlen(prefix);
++	char * line;
++	while ((line = find_line_starting(file, prefix, len)) != NULL) {
++		enum pcb_status st = (*cb)(line, prefix, data);
++		free (line);
++		if (st == pcb_stop)
++			return;
++	}
++}
++
++static enum pcb_status
++process_leader_cb(const char * line, const char * prefix, void * data)
++{
++	pid_t * pidp = data;
++	*pidp = atoi(line + strlen(prefix));
++	return pcb_stop;
++}
++
++pid_t
++process_leader(pid_t pid)
++{
++	pid_t tgid = pid;
++	FILE * file = open_status_file(pid);
++	if (file != NULL) {
++		each_line_starting(file, "Tgid:\t", &process_leader_cb, &tgid);
++		fclose(file);
++	}
++
++	return tgid;
++}
++
++static enum pcb_status
++process_stopped_cb(const char * line, const char * prefix, void * data)
++{
++	char c = line[strlen(prefix)];
++	// t:tracing stop, T:job control stop
++	*(int *)data = (c == 't' || c == 'T');
++	return pcb_stop;
++}
++
++int
++process_stopped(pid_t pid)
++{
++	int is_stopped = -1;
++	FILE * file = open_status_file(pid);
++	if (file != NULL) {
++		each_line_starting(file, "State:\t", &process_stopped_cb,
++				   &is_stopped);
++		fclose(file);
++	}
++	return is_stopped;
++}
++
++static enum pcb_status
++process_status_cb(const char * line, const char * prefix, void * data)
++{
++	*(char *)data = line[strlen(prefix)];
++	return pcb_stop;
++}
++
++char
++process_status(pid_t pid)
++{
++	char ret = '?';
++	FILE * file = open_status_file(pid);
++	if (file != NULL) {
++		each_line_starting(file, "State:\t", &process_status_cb, &ret);
++		fclose(file);
++	}
++	return ret;
++}
++
++static int
++all_digits(const char *str)
++{
++	while (isdigit(*str))
++		str++;
++	return !*str;
++}
++
++int
++process_tasks(pid_t pid, pid_t **ret_tasks, size_t *ret_n)
++{
++	PROC_PID_FILE(fn, "/proc/%d/task", pid);
++	DIR * d = opendir(fn);
++	if (d == NULL)
++		return -1;
++
++	/* XXX This is racy.  We need to stop the tasks that we
++	   discover this way and re-scan the directory to eventually
++	   reach a full set of tasks.  */
++	pid_t *tasks = NULL;
++	size_t n = 0;
++	size_t alloc = 0;
++
++	while (1) {
++		struct dirent entry;
++		struct dirent *result;
++		if (readdir_r(d, &entry, &result) != 0) {
++			free(tasks);
++			return -1;
++		}
++		if (result == NULL)
++			break;
++		if (result->d_type == DT_DIR && all_digits(result->d_name)) {
++			pid_t npid = atoi(result->d_name);
++			if (n >= alloc) {
++				alloc = alloc > 0 ? (2 * alloc) : 8;
++				pid_t *ntasks = realloc(tasks,
++							sizeof(*tasks) * alloc);
++				if (ntasks == NULL) {
++					free(tasks);
++					return -1;
++				}
++				tasks = ntasks;
++			}
++			if (n >= alloc)
++				abort();
++			tasks[n++] = npid;
++		}
++	}
++
++	closedir(d);
++
++	*ret_tasks = tasks;
++	*ret_n = n;
++	return 0;
++}
++
++int
++task_kill (pid_t pid, int sig)
++{
++	// Taken from GDB
++        int ret;
++
++        errno = 0;
++        ret = syscall (__NR_tkill, pid, sig);
++	return ret;
++}
+Только в ltrace-0.5-pm/sysdeps/linux-gnu: proc.c~
+diff -urp ltrace-0.5/sysdeps/linux-gnu/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/trace.c	2011-07-28 19:42:52.535644571 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/trace.c	2011-07-28 21:02:25.328946754 +0200
+@@ -7,6 +7,7 @@
+ #include "ptrace.h"
+ #include <asm/unistd.h>
+ #include <linux/ptrace.h>
++#include <assert.h>
+ 
+ #include "ltrace.h"
+ #include "options.h"
+@@ -20,11 +21,21 @@ void trace_me(void)
+ 	}
+ }
+ 
+-int trace_pid(pid_t pid)
+-{
++int
++trace_pid(pid_t pid) {
+ 	if (ptrace(PTRACE_ATTACH, pid, 1, 0) < 0) {
+ 		return -1;
+ 	}
++
++	/* man ptrace: PTRACE_ATTACH attaches to the process specified
++	   in pid.  The child is sent a SIGSTOP, but will not
++	   necessarily have stopped by the completion of this call;
++	   use wait() to wait for the child to stop. */
++	if (waitpid (pid, NULL, __WALL) != pid) {
++		perror ("trace_pid: waitpid");
++		return -1;
++	}
++
+ 	return 0;
+ }
+ 
+Только в ltrace-0.5-pm/sysdeps/linux-gnu: trace.c~
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2011-07-28 19:42:52.562645679 +0200
++++ ltrace-0.5-pm/wait_for_something.c	2011-07-28 21:02:05.502209866 +0200
+@@ -117,14 +117,19 @@ struct event *wait_for_something(void)
+ 		return &event;
+ 	}
+ 	get_arch_dep(event.proc);
+-	event.proc->instruction_pointer = NULL;
+-	if (event.proc->breakpoints_enabled == -1) {
+-		enable_all_breakpoints(event.proc);
+-		event.thing = LT_EV_NONE;
++	if (event.proc->breakpoints_enabled == -1)
+ 		trace_set_options(event.proc, event.proc->pid);
+-		continue_process(event.proc->pid);
+-		return &event;
++
++	struct process *leader = event.proc->leader;
++	if (leader == event.proc) {
++		if (event.proc->breakpoints_enabled == -1) {
++			event.thing = LT_EV_NONE;
++			enable_all_breakpoints(event.proc);
++			continue_process(event.proc->pid);
++			return &event;
++		}
+ 	}
++
+ 	event.proc->instruction_pointer = get_instruction_pointer(event.proc);
+ 	if (event.proc->instruction_pointer == (void *)(uintptr_t)-1) {
+ 		if (errno != 0)

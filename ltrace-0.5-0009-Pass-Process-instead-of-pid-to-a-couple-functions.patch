@@ -1,0 +1,169 @@
+diff -urp ltrace-0.5/breakpoints.c ltrace-0.5-pm/breakpoints.c
+--- ltrace-0.5/breakpoints.c	2011-07-28 17:05:39.850711297 +0200
++++ ltrace-0.5-pm/breakpoints.c	2011-07-28 17:08:16.936629185 +0200
+@@ -59,7 +59,7 @@ insert_breakpoint(struct process *proc, 
+ 	}
+ 	sbp->enabled++;
+ 	if (sbp->enabled == 1 && proc->pid)
+-		enable_breakpoint(proc->pid, sbp);
++		enable_breakpoint(proc, sbp);
+ }
+ 
+ void delete_breakpoint(struct process *proc, void *addr)
+@@ -72,14 +72,14 @@ void delete_breakpoint(struct process *p
+ 
+ 	sbp->enabled--;
+ 	if (sbp->enabled == 0)
+-		disable_breakpoint(proc->pid, sbp);
++		disable_breakpoint(proc, sbp);
+ 	assert(sbp->enabled >= 0);
+ }
+ 
+ static void enable_bp_cb(void *addr, void *sbp, void *proc)
+ {
+ 	if (((struct breakpoint *)sbp)->enabled) {
+-		enable_breakpoint(((struct process *)proc)->pid, sbp);
++		enable_breakpoint(proc, sbp);
+ 	}
+ }
+ 
+@@ -118,7 +118,7 @@ void enable_all_breakpoints(struct proce
+ static void disable_bp_cb(void *addr, void *sbp, void *proc)
+ {
+ 	if (((struct breakpoint *)sbp)->enabled) {
+-		disable_breakpoint(((struct process *)proc)->pid, sbp);
++		disable_breakpoint(proc, sbp);
+ 	}
+ }
+ 
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-07-28 17:05:39.876712596 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 17:08:52.945440538 +0200
+@@ -201,14 +201,15 @@ extern void *get_instruction_pointer(str
+ extern void set_instruction_pointer(struct process *proc, void *addr);
+ extern void *get_stack_pointer(struct process *proc);
+ extern void *get_return_addr(struct process *proc, void *stack_pointer);
+-extern void enable_breakpoint(pid_t pid, struct breakpoint *sbp);
+-extern void disable_breakpoint(pid_t pid, const struct breakpoint *sbp);
++extern void enable_breakpoint(struct process *proc, struct breakpoint *sbp);
++extern void disable_breakpoint(struct process *proc, const struct breakpoint *sbp);
+ extern int syscall_p(struct process *proc, int status, int *sysnum);
+ extern void continue_process(pid_t pid);
+ extern void continue_after_signal(pid_t pid, int signum);
+ extern void continue_after_breakpoint(struct process *proc,
+ 				      struct breakpoint *sbp);
+-extern void continue_enabling_breakpoint(pid_t pid, struct breakpoint *sbp);
++extern void continue_enabling_breakpoint(struct process *proc,
++					 struct breakpoint *sbp);
+ extern long gimme_arg(enum tof type, struct process *proc, int arg_num);
+ extern void save_register_args(enum tof type, struct process *proc);
+ extern int umovestr(struct process *proc, void *addr, int len, void *laddr);
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-07-28 17:05:39.851711346 +0200
++++ ltrace-0.5-pm/process_event.c	2011-07-28 17:10:34.572545198 +0200
+@@ -116,7 +116,7 @@ static void process_clone(struct event *
+ 	if (pending_new(p->pid)) {
+ 		pending_new_remove(p->pid);
+ 		if (p->breakpoint_being_enabled) {
+-			enable_breakpoint(p->pid, p->breakpoint_being_enabled);
++			enable_breakpoint(p, p->breakpoint_being_enabled);
+ 			p->breakpoint_being_enabled = NULL;
+ 		}
+ 		if (event->proc->state == STATE_ATTACHED && opt_f) {
+@@ -142,7 +142,7 @@ static void process_new(struct event * e
+ 	} else {
+ 		assert(proc->state == STATE_BEING_CREATED);
+ 		if (proc->breakpoint_being_enabled) {
+-			enable_breakpoint(proc->pid, proc->breakpoint_being_enabled);
++			enable_breakpoint(proc, proc->breakpoint_being_enabled);
+ 			proc->breakpoint_being_enabled = NULL;
+ 		}
+ 		if (opt_f) {
+@@ -414,9 +414,8 @@ static void process_breakpoint(struct ev
+ 		}
+ #endif
+ 		/* Reinsert breakpoint */
+-		continue_enabling_breakpoint(event->proc->pid,
+-					     event->proc->
+-					     breakpoint_being_enabled);
++		sbp = event->proc->breakpoint_being_enabled;
++		continue_enabling_breakpoint(event->proc, sbp);
+ 		event->proc->breakpoint_being_enabled = NULL;
+ 		return;
+ 	}
+diff -urp ltrace-0.5/sysdeps/linux-gnu/breakpoint.c ltrace-0.5-pm/sysdeps/linux-gnu/breakpoint.c
+--- ltrace-0.5/sysdeps/linux-gnu/breakpoint.c	2011-07-28 17:05:39.853711447 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/breakpoint.c	2011-07-28 17:16:53.363472863 +0200
+@@ -13,12 +13,9 @@ static unsigned char break_insn[] = BREA
+ 
+ #ifdef ARCH_HAVE_ENABLE_BREAKPOINT
+ extern void arch_enable_breakpoint(pid_t, struct breakpoint *);
+-void enable_breakpoint(pid_t pid, struct breakpoint *sbp)
+-{
+-	arch_enable_breakpoint(pid, sbp);
+-}
+-#else
+-void enable_breakpoint(pid_t pid, struct breakpoint *sbp)
++#else				/* ARCH_HAVE_ENABLE_BREAKPOINT */
++void
++arch_enable_breakpoint(pid_t pid, struct breakpoint *sbp)
+ {
+ 	unsigned int i, j;
+ 
+@@ -40,14 +37,17 @@ void enable_breakpoint(pid_t pid, struct
+ }
+ #endif				/* ARCH_HAVE_ENABLE_BREAKPOINT */
+ 
+-#ifdef ARCH_HAVE_DISABLE_BREAKPOINT
+-extern void arch_disable_breakpoint(pid_t, const struct breakpoint *sbp);
+-void disable_breakpoint(pid_t pid, const struct breakpoint *sbp)
++void
++enable_breakpoint(struct process * proc, struct breakpoint *sbp)
+ {
+-	arch_disable_breakpoint(pid, sbp);
++	arch_enable_breakpoint(proc->pid, sbp);
+ }
++
++#ifdef ARCH_HAVE_DISABLE_BREAKPOINT
++extern void arch_disable_breakpoint(pid_t, const struct breakpoint *sbp);
+ #else
+-void disable_breakpoint(pid_t pid, const struct breakpoint *sbp)
++void
++arch_disable_breakpoint(pid_t pid, const struct breakpoint *sbp)
+ {
+ 	unsigned int i, j;
+ 
+@@ -68,3 +68,9 @@ void disable_breakpoint(pid_t pid, const
+ 	}
+ }
+ #endif				/* ARCH_HAVE_DISABLE_BREAKPOINT */
++
++void
++disable_breakpoint(struct process * proc, const struct breakpoint *sbp)
++{
++	arch_disable_breakpoint(proc->pid, sbp);
++}
+diff -urp ltrace-0.5/sysdeps/linux-gnu/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/trace.c	2011-07-28 17:05:39.840710796 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/trace.c	2011-07-28 17:17:38.573721627 +0200
+@@ -62,16 +62,16 @@ void continue_process(pid_t pid)
+ 	continue_after_signal(pid, 0);
+ }
+ 
+-void continue_enabling_breakpoint(pid_t pid, struct breakpoint *sbp)
++void continue_enabling_breakpoint(struct process *proc, struct breakpoint *sbp)
+ {
+-	enable_breakpoint(pid, sbp);
+-	continue_process(pid);
++	enable_breakpoint(proc, sbp);
++	continue_process(proc->pid);
+ }
+ 
+ void continue_after_breakpoint(struct process *proc, struct breakpoint *sbp)
+ {
+ 	if (sbp->enabled)
+-		disable_breakpoint(proc->pid, sbp);
++		disable_breakpoint(proc, sbp);
+ 	set_instruction_pointer(proc, sbp->addr);
+ 	if (sbp->enabled == 0) {
+ 		continue_process(proc->pid);

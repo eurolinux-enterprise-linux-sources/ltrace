@@ -1,0 +1,82 @@
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2011-07-29 12:59:28.010619380 +0200
++++ ltrace-0.5-pm/wait_for_something.c	2011-07-29 13:04:23.293186880 +0200
+@@ -212,8 +212,47 @@ struct event *wait_for_something(void)
+ 		}
+ 	}
+ 
++	/* The process should be stopped after the waitpid call.  But
++	 * when the whole thread group is terminated, we see
++	 * individual tasks spontaneously transitioning from 't' to
++	 * 'R' and 'Z'.  Calls to ptrace fail and /proc/pid/status may
++	 * not even be available anymore, so we can't check in
++	 * advance.  So we just drop the error checking around ptrace
++	 * calls.  We check for termination ex post when it fails,
++	 * suppress the event, and let the event loop collect the
++	 * termination in the next iteration.  */
++#define CHECK_PROCESS_TERMINATED					\
++	do {								\
++		int errno_save = errno;					\
++		switch (process_stopped(pid))				\
++		case 0:							\
++		case -1: {						\
++			event.thing = LT_EV_NONE;			\
++			continue_process(event.proc->pid);		\
++			return &event;					\
++		}							\
++		errno = errno_save;					\
++	} while (0)
++
++	event.proc->instruction_pointer = (void *)(uintptr_t)-1;
++
++	/* Check for task termination now, before we have a need to
++	 * call CHECK_PROCESS_TERMINATED later.  That would suppress
++	 * the event that we are processing.  */
++	if (WIFEXITED(status)) {
++		event.thing = LT_EV_EXIT;
++		event.e_un.ret_val = WEXITSTATUS(status);
++		return &event;
++	}
++	if (WIFSIGNALED(status)) {
++		event.thing = LT_EV_EXIT_SIGNAL;
++		event.e_un.signum = WTERMSIG(status);
++		return &event;
++	}
++
+ 	event.proc->instruction_pointer = get_instruction_pointer(event.proc);
+ 	if (event.proc->instruction_pointer == (void *)(uintptr_t)-1) {
++		CHECK_PROCESS_TERMINATED;
+ 		if (errno != 0)
+ 			perror("get_instruction_pointer");
+  	}
+@@ -227,9 +268,9 @@ struct event *wait_for_something(void)
+ 		event.e_un.sysnum = tmp;
+ 		return &event;
+ 	case -1:
+-		event.thing = LT_EV_NONE;
+-		continue_process(event.proc->pid);
+-		return &event;
++		CHECK_PROCESS_TERMINATED;
++		if (errno != 0)
++			perror("syscall_p");
+ 	}
+ 	if (WIFSTOPPED(status) && ((status>>16 == PTRACE_EVENT_FORK) || (status>>16 == PTRACE_EVENT_VFORK) || (status>>16 == PTRACE_EVENT_CLONE))) {
+ 		unsigned long data;
+@@ -243,16 +284,6 @@ struct event *wait_for_something(void)
+ 		event.thing = LT_EV_EXEC;
+ 		return &event;
+ 	}
+-	if (WIFEXITED(status)) {
+-		event.thing = LT_EV_EXIT;
+-		event.e_un.ret_val = WEXITSTATUS(status);
+-		return &event;
+-	}
+-	if (WIFSIGNALED(status)) {
+-		event.thing = LT_EV_EXIT_SIGNAL;
+-		event.e_un.signum = WTERMSIG(status);
+-		return &event;
+-	}
+ 	if (!WIFSTOPPED(status)) {
+ 		event.thing = LT_EV_UNKNOWN;
+ 		return &event;
+Только в ltrace-0.5-pm/: wait_for_something.c~

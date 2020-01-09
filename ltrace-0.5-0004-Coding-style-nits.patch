@@ -1,0 +1,75 @@
+diff -urp ltrace-0.5/breakpoints.c ltrace-0.5-pm/breakpoints.c
+--- ltrace-0.5/breakpoints.c	2011-07-28 16:44:31.287754754 +0200
++++ ltrace-0.5-pm/breakpoints.c	2011-07-28 16:44:28.623616513 +0200
+@@ -20,6 +20,8 @@
+ 
+ struct breakpoint *address2bpstruct(struct process *proc, void *addr)
+ {
++	assert(proc != NULL);
++	assert(proc->breakpoints != NULL);
+ 	if (!proc->breakpoints) {
+ 		proc->breakpoints =
+ 		  dict_init(dict_key2hash_int, dict_key_cmp_int);
+@@ -162,13 +164,14 @@ void breakpoints_init(struct process *pr
+ 	if (opt_L && proc->filename) {
+ 		proc->list_of_symbols = read_elf(proc);
+ 		if (opt_e) {
+-			struct library_symbol **tmp1 = &(proc->list_of_symbols);
++			struct library_symbol **tmp1 = &proc->list_of_symbols;
+ 			while (*tmp1) {
+ 				struct opt_e_t *tmp2 = opt_e;
+ 				int keep = !opt_e_enable;
+ 
+ 				while (tmp2) {
+-					if (!strcmp((*tmp1)->name, tmp2->name)) {
++					if (!strcmp((*tmp1)->name,
++						    tmp2->name)) {
+ 						keep = opt_e_enable;
+ 					}
+ 					tmp2 = tmp2->next;
+@@ -196,8 +199,7 @@ void reinitialize_breakpoints(struct pro
+ 
+ 	while (sym) {
+ 		if (sym->needs_init) {
+-			insert_breakpoint(proc, sym2addr(proc, sym),
+-					  sym);
++			insert_breakpoint(proc, sym2addr(proc, sym), sym);
+ 			if (sym->needs_init && !sym->is_weak) {
+ 				fprintf(stderr,
+ 					"could not re-initialize breakpoint for \"%s\" in file \"%s\"\n",
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-07-28 16:44:31.276754193 +0200
++++ ltrace-0.5-pm/process_event.c	2011-07-28 16:44:28.639617345 +0200
+@@ -322,7 +322,7 @@ static void process_syscall(struct event
+ 	if (event->proc->state != STATE_IGNORED) {
+ 		if (opt_S) {
+ 			output_left(LT_TOF_SYSCALL, event->proc,
+-				sysname(event->proc, event->e_un.sysnum));
++				    sysname(event->proc, event->e_un.sysnum));
+ 		}
+ 		if (event->proc->breakpoints_enabled == 0) {
+ 			enable_all_breakpoints(event->proc);
+@@ -543,7 +543,7 @@ callstack_push_symfunc(struct process *p
+ 
+ 	elem->return_addr = proc->return_addr;
+         if (elem->return_addr) {
+-		insert_breakpoint(proc, elem->return_addr, 0);
++		insert_breakpoint(proc, elem->return_addr, NULL);
+ 	}
+ 
+ 	proc->callstack_depth++;
+diff -urp ltrace-0.5/sysdeps/linux-gnu/breakpoint.c ltrace-0.5-pm/sysdeps/linux-gnu/breakpoint.c
+--- ltrace-0.5/sysdeps/linux-gnu/breakpoint.c	2006-06-14 06:55:21.000000000 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/breakpoint.c	2011-07-28 16:44:28.632616981 +0200
+@@ -25,9 +25,8 @@ void enable_breakpoint(pid_t pid, struct
+ 	debug(1, "enable_breakpoint(%d,%p)", pid, sbp->addr);
+ 
+ 	for (i = 0; i < 1 + ((BREAKPOINT_LENGTH - 1) / sizeof(long)); i++) {
+-		long a =
+-		    ptrace(PTRACE_PEEKTEXT, pid, sbp->addr + i * sizeof(long),
+-			   0);
++		long a = ptrace(PTRACE_PEEKTEXT, pid,
++				sbp->addr + i * sizeof(long), 0);
+ 		for (j = 0;
+ 		     j < sizeof(long)
+ 		     && i * sizeof(long) + j < BREAKPOINT_LENGTH; j++) {

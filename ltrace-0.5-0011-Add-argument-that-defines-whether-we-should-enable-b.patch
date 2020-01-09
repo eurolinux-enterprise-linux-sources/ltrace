@@ -1,0 +1,180 @@
+diff -urp ltrace-0.5/breakpoints.c ltrace-0.5-pm/breakpoints.c
+--- ltrace-0.5/breakpoints.c	2011-07-28 17:46:37.514702075 +0200
++++ ltrace-0.5-pm/breakpoints.c	2011-07-28 17:49:29.722677758 +0200
+@@ -31,7 +31,7 @@ struct breakpoint *address2bpstruct(stru
+ 
+ void
+ insert_breakpoint(struct process *proc, void *addr,
+-		  struct library_symbol *libsym)
++		  struct library_symbol *libsym, int enable)
+ {
+ 	struct breakpoint *sbp;
+ 	debug(1, "insert_breakpoint(symbol=%s, addr=%p)", libsym?libsym->name:"(nil)", addr);
+@@ -60,8 +60,9 @@ insert_breakpoint(struct process *proc, 
+ 			libsym->brkpnt = sbp;
+ 	}
+ 	sbp->enabled++;
+-	if (sbp->enabled == 1 && proc->pid)
++	if (sbp->enabled == 1 && enable) {
+ 		enable_breakpoint(proc, sbp);
++	}
+ }
+ 
+ void delete_breakpoint(struct process *proc, void *addr)
+@@ -137,7 +139,8 @@ static void free_bp_cb(void *addr, void 
+ 	free(sbp);
+ }
+ 
+-void breakpoints_init(struct process *proc)
++void
++breakpoints_init(struct process *proc, int enable)
+ {
+ 	struct library_symbol *sym;
+ 
+@@ -184,10 +187,8 @@ void breakpoints_init(struct process *pr
+ 			}
+ 		}
+ 	}
+-	for (sym = proc->list_of_symbols; sym; sym = sym->next) {
+-		/* proc->pid==0 delays enabling. */
+-		insert_breakpoint(proc, sym2addr(proc, sym), sym);
+-	}
++	for (sym = proc->list_of_symbols; sym; sym = sym->next)
++		insert_breakpoint(proc, sym2addr(proc, sym), sym, enable);
+ 	proc->callstack_depth = 0;
+ 	proc->breakpoints_enabled = -1;
+ 	proc->old = 0;
+@@ -199,7 +200,7 @@ void reinitialize_breakpoints(struct pro
+ 
+ 	while (sym) {
+ 		if (sym->needs_init) {
+-			insert_breakpoint(proc, sym2addr(proc, sym), sym);
++			insert_breakpoint(proc, sym2addr(proc, sym), sym, 1);
+ 			if (sym->needs_init && !sym->is_weak) {
+ 				fprintf(stderr,
+ 					"could not re-initialize breakpoint for \"%s\" in file \"%s\"\n",
+Только в ltrace-0.5-pm: breakpoints.c~
+diff -urp ltrace-0.5/ltrace.c ltrace-0.5-pm/ltrace.c
+--- ltrace-0.5/ltrace.c	2011-07-28 17:46:37.505701652 +0200
++++ ltrace-0.5-pm/ltrace.c	2011-07-28 17:51:40.246706585 +0200
+@@ -126,7 +126,7 @@ int main(int argc, char **argv)
+ 		struct ltelf lte = {};
+ 		open_elf(&lte, command);
+ 
+-		open_program(command, execute_program(command, argv));
++		open_program(command, execute_program(command, argv), 0);
+ 	}
+ 	opt_p_tmp = opt_p;
+ 	while (opt_p_tmp) {
+Только в ltrace-0.5-pm: ltrace.c~
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-07-28 17:46:37.515702123 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 17:50:12.859671971 +0200
+@@ -177,15 +177,16 @@ extern pid_t execute_program(const char 
+ extern int display_arg(enum tof type, struct process *proc, int arg_num,
+ 		       enum arg_type at);
+ extern struct breakpoint *address2bpstruct(struct process *proc, void *addr);
+-extern void breakpoints_init(struct process *proc);
++extern void breakpoints_init(struct process *proc, int enable);
+ extern void insert_breakpoint(struct process *proc, void *addr,
+-			      struct library_symbol *libsym);
++			      struct library_symbol *libsym, int enable);
+ extern void delete_breakpoint(struct process *proc, void *addr);
+ extern void enable_all_breakpoints(struct process *proc);
+ extern void disable_all_breakpoints(struct process *proc);
+ extern void reinitialize_breakpoints(struct process *);
+ 
+-extern struct process *open_program(char *filename, pid_t pid);
++extern struct process *open_program(char *filename, pid_t pid,
++				    int init_breakpoints);
+ extern void open_pid(pid_t pid, int verbose);
+ extern void open_forked_pid(pid_t pid, int early);
+ extern void show_summary(void);
+Только в ltrace-0.5-pm: ltrace.h~
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2011-07-28 17:46:37.507701747 +0200
++++ ltrace-0.5-pm/proc.c	2011-07-28 17:53:16.831159262 +0200
+@@ -13,7 +13,8 @@
+ #include "options.h"
+ #include "elf.h"
+ 
+-struct process *open_program(char *filename, pid_t pid)
++struct process *
++open_program(char *filename, pid_t pid, int enable)
+ {
+ 	struct process *proc;
+ 	assert(pid != 0);
+@@ -24,11 +25,12 @@ struct process *open_program(char *filen
+ 	}
+ 	proc->filename = strdup(filename);
+ 	proc->breakpoints_enabled = -1;
+-	breakpoints_init(proc); 
+ 	proc->pid = pid;
+ 
+ 	proc->next = list_of_processes;
+ 	list_of_processes = proc;
++	breakpoints_init(proc, enable);
++
+ 	return proc;
+ }
+ 
+@@ -54,7 +56,7 @@ void open_pid(pid_t pid, int verbose)
+ 		return;
+ 	}
+ #endif
+-	proc = open_program(filename, pid);
++	proc = open_program(filename, pid, 1);
+ 	continue_process(pid);
+ 	proc->breakpoints_enabled = 1;
+ }
+@@ -62,10 +64,10 @@ void open_pid(pid_t pid, int verbose)
+ void open_forked_pid(pid_t pid, int early)
+ {
+ 	char *filename = pid2name(pid);
+-	struct process *proc = open_program(filename, pid);
++	struct process *proc = open_program(filename, pid, 1);
+ 	proc->early = early;
+ #ifdef __powerpc__
+-	breakpoints_init(proc);
++	breakpoints_init(proc, 1);
+ 	proc->breakpoints_enabled = 1;
+ #endif
+ }
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-07-28 17:46:37.517702216 +0200
++++ ltrace-0.5-pm/process_event.c	2011-07-28 17:51:22.861904784 +0200
+@@ -349,7 +349,7 @@ static void process_exec(struct event * 
+ 	proc->filename = pid2name(proc->pid);
+ 	saved_pid = proc->pid;
+ 	proc->pid = 0;
+-	breakpoints_init(proc);
++	breakpoints_init(proc, 0);
+ 	proc->pid = saved_pid;
+ 	proc->callstack_depth = 0;
+ 	continue_process(proc->pid);
+@@ -445,14 +445,14 @@ static void process_breakpoint(struct ev
+ 				if (memcmp(&a, break_insn, BREAKPOINT_LENGTH)) {
+ 					sbp->enabled--;
+ 					insert_breakpoint(event->proc, addr,
+-							  libsym);
++							  libsym, 1);
+ 				}
+ 			} else {
+ 				sbp = libsym->brkpnt;
+ 				assert(sbp);
+ 				if (addr != sbp->addr) {
+ 					insert_breakpoint(event->proc, addr,
+-							  libsym);
++							  libsym, 1);
+ 				}
+ 			}
+ #endif
+@@ -542,7 +542,7 @@ callstack_push_symfunc(struct process *p
+ 
+ 	elem->return_addr = proc->return_addr;
+         if (elem->return_addr) {
+-		insert_breakpoint(proc, elem->return_addr, NULL);
++		insert_breakpoint(proc, elem->return_addr, NULL, 1);
+ 	}
+ 
+ 	proc->callstack_depth++;

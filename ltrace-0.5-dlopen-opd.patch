@@ -1,0 +1,85 @@
+diff -up ./elf.c~ ./elf.c
+--- ./elf.c~	2012-02-29 01:57:18.659492475 +0100
++++ ./elf.c	2012-02-29 19:44:26.823542634 +0100
+@@ -25,7 +25,7 @@ void add_library_symbol(GElf_Addr addr,
+ 			enum toplt type_of_plt, int is_weak);
+ int in_load_libraries(const char *name, struct ltelf *lte,
+ 		      size_t count, GElf_Sym *sym);
+-static GElf_Addr opd2addr(struct ltelf *ltc, void *addr);
++GElf_Addr opd2addr(struct ltelf *ltc, void *addr);
+ 
+ struct library_symbol *library_symbols = NULL;
+ struct ltelf main_lte;
+@@ -608,7 +608,8 @@ in_load_libraries(const char *name, stru
+ 	return 0;
+ }
+ 
+-static GElf_Addr opd2addr(struct ltelf *lte, void *addr)
++GElf_Addr
++opd2addr(struct ltelf *lte, void *addr)
+ {
+ 	long base;
+ 	long offset;
+diff -up ./elf.h~ ./elf.h
+--- ./elf.h~	2012-02-29 01:57:18.659492475 +0100
++++ ./elf.h	2012-02-29 19:42:43.050399959 +0100
+@@ -45,6 +45,7 @@ extern void open_elf(struct ltelf *lte,
+ extern struct library_symbol *read_elf(struct process *, GElf_Addr *entryp);
+ 
+ extern GElf_Addr arch_plt_sym_val(struct ltelf *, size_t, GElf_Rela *);
++extern GElf_Addr opd2addr(struct ltelf *ltc, void *addr);
+ 
+ extern struct ltelf main_lte;
+ extern int in_load_libraries(const char *name, struct ltelf *lte, size_t count, GElf_Sym *sym);
+diff -up ./sysdeps/linux-gnu/proc.c~ ./sysdeps/linux-gnu/proc.c
+--- ./sysdeps/linux-gnu/proc.c~	2012-02-29 01:57:18.649492172 +0100
++++ ./sysdeps/linux-gnu/proc.c	2012-02-29 21:04:02.348089810 +0100
+@@ -364,6 +375,19 @@ load_debug_struct(struct process *proc)
+ 	return rdbg;
+ }
+ 
++static int
++deref_opd(struct process *proc, GElf_Addr raddr, GElf_Addr *retp)
++{
++#ifdef __powerpc64__
++	if (umovebytes(proc, (void *)raddr, retp, sizeof(*retp))
++	    != sizeof(*retp))
++		return -1;
++#else
++	*retp = raddr;
++#endif
++	return 0;
++}
++
+ static void
+ linkmap_add_cb(void *data) { //const char *lib_name, ElfW(Addr) addr) {
+ 	int i = 0;
+@@ -403,7 +429,12 @@ linkmap_add_cb(void *data) { //const cha
+ 
+ 			if (in_load_libraries(xptr->name, &lte, 1, &sym)) {
+ 				debug(2, "found symbol %s @ %lx, adding it.", xptr->name, sym.st_value);
+-				addr = sym.st_value;
++				if (deref_opd(lm_add->proc, sym.st_value,
++					      &addr) < 0) {
++					fprintf(stderr, "Couldn't resolve OPD"
++						" for %s\n", xptr->name);
++					continue;
++				}
+ 				int indirect = (GELF_ST_TYPE(sym.st_info)
+ 						== STT_GNU_IFUNC);
+ 				char *xn = xptr->name;
+@@ -502,7 +546,13 @@ linkmap_init(struct process *proc, struc
+ 
+ 	data.lte = lte;
+ 
+-	add_library_symbol(rdbg->r_brk, "", &library_symbols, LS_TOPLT_NONE, 0);
++	GElf_Addr faddr;
++	if (deref_opd(proc, rdbg->r_brk, &faddr) < 0) {
++		fprintf(stderr, "Can't load r_brk address from OPD\n");
++		return -1;
++	}
++
++	add_library_symbol(faddr, "", &library_symbols, LS_TOPLT_NONE, 0);
+ 	insert_breakpoint(proc, sym2addr(proc, library_symbols), library_symbols, 1);
+ 
+ 	crawl_linkmap(proc, rdbg, hook_libdl_cb, &data);

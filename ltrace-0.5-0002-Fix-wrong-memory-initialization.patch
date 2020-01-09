@@ -1,0 +1,14 @@
+diff -up ltrace-0.5/elf.c\~ ltrace-0.5/elf.c
+--- ltrace-0.5/elf.c~	2011-07-28 16:05:28.572764712 +0200
++++ ltrace-0.5/elf.c	2011-07-28 16:24:54.550185659 +0200
+@@ -439,6 +439,8 @@ struct library_symbol *read_elf(struct p
+ 	struct opt_x_t *main_cheat;
+ 	int exit_out = 0;
+ 
++	memset(lte, 0, sizeof(lte));
++
+ 	elf_version(EV_CURRENT);
+ 
+ 	do_init_elf(lte, proc->filename);
+
+Diff finished.  Thu Jul 28 16:25:04 2011

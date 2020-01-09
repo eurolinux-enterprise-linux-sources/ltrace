@@ -1,0 +1,182 @@
+diff -up ./ltrace.c~ ./ltrace.c
+--- ./ltrace.c~	2012-04-10 17:25:17.806557562 +0200
++++ ./ltrace.c	2012-04-11 01:46:30.120683314 +0200
+@@ -57,7 +57,13 @@ stop_non_p_processes (struct process * p
+ 
+ static void signal_exit(int sig)
+ {
++	if (exiting != 0)
++		return;
++
+ 	exiting = 1;
++	if (should_call_ltrace_exiting())
++		check_ltrace_exiting();
++
+ 	debug(1, "Received interrupt signal; exiting...");
+ 	signal(SIGINT, SIG_IGN);
+ 	signal(SIGTERM, SIG_IGN);
+diff -up ./ltrace.h~ ./ltrace.h
+--- ./ltrace.h~	2012-04-05 23:27:23.868364251 +0200
++++ ./ltrace.h	2012-04-11 01:47:26.482391728 +0200
+@@ -312,7 +312,6 @@ extern void continue_after_signal(pid_t
+ extern void continue_after_syscall(struct process *proc, int sysnum, int ret_p);
+ extern void continue_after_breakpoint(struct process *proc, struct breakpoint *sbp);
+ extern void continue_after_vfork(struct process * proc);
+-extern void ltrace_exiting(void);
+ extern void continue_enabling_breakpoint(struct process *proc,
+ 					 struct breakpoint *sbp);
+ extern long gimme_arg(enum tof type, struct process *proc, int arg_num);
+@@ -339,6 +338,17 @@ extern struct process *each_task(struct
+ 							void * data),
+ 				 void * data);
+ 
++/* These three functions cooperate in installing process exit handler.
++ * LTRACE_EXITING is a back end function that is called to do the
++ * actual installation.  SHOULD_CALL_LTRACE_EXITING is called by a
++ * signal handler in ltrace.c to determine whether it is safe (and
++ * desired) to install a process exit handler right away, or whether
++ * it should be postponed and done in PROCESS_EVENT.
++ * CHECK_LTRACE_EXITING is a utility wrapper that calls
++ * LTRACE_EXITING.  */
++int should_call_ltrace_exiting(void);
++void check_ltrace_exiting(void);
++void ltrace_exiting(void);
+ 
+ extern ulong get_child_pid(pid_t pid);
+ #endif
+diff -up ./proc.c~ ./proc.c
+--- ./proc.c~	2012-04-05 23:27:23.868364251 +0200
++++ ./proc.c	2012-04-11 01:00:52.927794135 +0200
+@@ -35,7 +35,7 @@ open_program(char *filename, pid_t pid,
+ 		return NULL;
+ 	}
+ 
+-	if (proc->leader == proc)
++	if (proc->leader == proc) {
+ 		trace_set_options(proc, proc->pid);
+ 		if (breakpoints_init(proc, enable)) {
+ 			fprintf(stderr, "failed to init breakpoints %d\n",
+@@ -43,6 +43,7 @@ open_program(char *filename, pid_t pid,
+ 			remove_process(proc);
+ 			return NULL;
+ 		}
++	}
+ 
+ 	return proc;
+ }
+diff -up ./process_event.c~ ./process_event.c
+--- ./process_event.c~	2012-04-05 23:27:23.888364853 +0200
++++ ./process_event.c	2012-04-11 01:45:37.449086751 +0200
+@@ -231,13 +231,19 @@ call_handler(struct process * proc, stru
+ 	return (*handler->on_event) (handler, event);
+ }
+ 
+-void process_event(struct event *event)
++void
++check_ltrace_exiting(void)
+ {
+ 	if (exiting == 1) {
+ 		exiting = 2;
+ 		debug(1, "ltrace about to exit");
+ 		ltrace_exiting();
+ 	}
++}
++
++void process_event(struct event *event)
++{
++	check_ltrace_exiting();
+ 
+ 	/* If the thread group or an individual task define an
+ 	   overriding event handler, give them a chance to kick in.
+diff -up ./sysdeps/linux-gnu/trace.c~ ./sysdeps/linux-gnu/trace.c
+--- ./sysdeps/linux-gnu/trace.c~	2012-04-05 23:27:23.818362745 +0200
++++ ./sysdeps/linux-gnu/trace.c	2012-04-11 01:59:48.664801196 +0200
+@@ -234,8 +234,8 @@ task_stopped(struct process * task, void
+ 	case ps_invalid:
+ 	case ps_tracing_stop:
+ 	case ps_zombie:
+-	case ps_sleeping:
+ 		return pcb_cont;
++	case ps_sleeping:
+ 	case ps_stop:
+ 	case ps_other:
+ 		return pcb_stop;
+@@ -415,7 +426,8 @@ detach_process(struct process * leader)
+ }
+ 
+ static void
+-handle_stopping_event(struct pid_task * task_info, struct event ** eventp)
++handle_stopping_event(int exiting,
++		      struct pid_task *task_info, struct event **eventp)
+ {
+ 	/* Mark all events, so that we know whom to SIGCONT later.  */
+ 	if (task_info != NULL)
+@@ -432,11 +444,13 @@ handle_stopping_event(struct pid_task *
+ 		    && !task_info->delivered) {
+ 			task_info->delivered = 1;
+ 			*eventp = NULL; // sink the event
+-		} else
++
++		} else if (!exiting) {
+ 			fprintf(stderr, "suspicious: %d got SIGSTOP, but "
+ 				"sigstopped=%d and delivered=%d\n",
+ 				task_info->pid, task_info->sigstopped,
+ 				task_info->delivered);
++		}
+ 	}
+ }
+ 
+@@ -543,7 +561,7 @@ process_stopping_on_event(Event_Handler
+ 	struct pid_task * task_info = get_task_info(&self->pids, task->pid);
+ 	if (task_info == NULL)
+ 		fprintf(stderr, "new task??? %d\n", task->pid);
+-	handle_stopping_event(task_info, &event);
++	handle_stopping_event(self->exiting, task_info, &event);
+ 
+ 	int state = self->state;
+ 	int event_to_queue = !event_exit_or_none_p(event);
+@@ -775,7 +801,7 @@ ltrace_exiting_on_event(Event_Handler *
+ 	struct process * leader = task->leader;
+ 
+ 	struct pid_task * task_info = get_task_info(&self->pids, task->pid);
+-	handle_stopping_event(task_info, &event);
++	handle_stopping_event(1, task_info, &event);
+ 
+ 	if (event != NULL && event->thing == LT_EV_BREAKPOINT)
+ 		undo_breakpoint(event, leader);
+diff -up ./wait_for_something.c~ ./wait_for_something.c
+--- ./wait_for_something.c~	2012-04-05 23:27:23.868364251 +0200
++++ ./wait_for_something.c	2012-04-11 01:47:16.412086481 +0200
+@@ -163,6 +163,20 @@ next_qd_event(void)
+ 	return each_qd_event(&event_process_not_reenabling, NULL);
+ }
+ 
++static int in_waitpid = 0;
++
++int
++should_call_ltrace_exiting(void)
++{
++	/* If IN_WAITPID is set, we are in or around waitpid call in
++	 * wait_for_something.  That means that we can touch process
++	 * handlers and such.  It also means that unless we do it
++	 * right away, we will wait until one of the processes goes
++	 * through an event, and that can be forever, because waitpid
++	 * doesn't get interrupted for SIGINT.  */
++	return in_waitpid;
++}
++
+ struct event *wait_for_something(void)
+ {
+ 	pid_t pid;
+@@ -181,7 +196,11 @@ struct event *wait_for_something(void)
+ 		debug(1, "No more children");
+ 		exit(0);
+ 	}
++
++	in_waitpid = 1;
+ 	pid = waitpid(-1, &status, __WALL);
++	in_waitpid = 0;
++
+ 	if (pid == -1) {
+ 		if (errno == ECHILD) {
+ 			debug(1, "No more children");

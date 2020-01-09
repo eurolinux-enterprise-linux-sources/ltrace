@@ -1,0 +1,114 @@
+diff -up ./ltrace.h~ ./ltrace.h
+--- ./ltrace.h~	2012-02-23 22:25:05.840054740 +0100
++++ ./ltrace.h	2012-02-28 17:10:48.445322751 +0100
+@@ -85,6 +85,7 @@ struct library_symbol {
+ 	char needs_init;
+ 	enum toplt plt_type;
+ 	char is_weak;
++	char is_indirect;
+ 	struct library_symbol *next;
+ };
+ 
+diff -up ./process_event.c~ ./process_event.c
+--- ./process_event.c~	2012-02-23 22:25:05.843054740 +0100
++++ ./process_event.c	2012-02-28 22:07:47.051728994 +0100
+@@ -439,16 +439,17 @@ static void process_breakpoint(struct ev
+ 	for (i = event->proc->callstack_depth - 1; i >= 0; i--) {
+ 		if (event->e_un.brk_addr ==
+ 		    event->proc->callstack[i].return_addr) {
++
++			struct library_symbol *libsym =
++			    event->proc->callstack[i].c_un.libfunc;
+ #ifdef __powerpc__
+ 			/*
+ 			 * PPC HACK! (XXX FIXME TODO)
+ 			 * The PLT gets modified during the first call,
+ 			 * so be sure to re-enable the breakpoint.
+ 			 */
+-			unsigned long a;
+-			struct library_symbol *libsym =
+-			    event->proc->callstack[i].c_un.libfunc;
+ 			void *addr = sym2addr(event->proc, libsym);
++			unsigned long a;
+ 
+ 			if (libsym->plt_type != LS_TOPLT_POINT) {
+ 				unsigned char break_insn[] = BREAKPOINT_VALUE;
+@@ -481,11 +482,28 @@ static void process_breakpoint(struct ev
+ 				}
+ 			}
+ 			callstack_pop(event->proc);
++
+ 			event->proc->return_addr = event->e_un.brk_addr;
+ 			if (event->proc->state != STATE_IGNORED) {
+ 				output_right(LT_TOF_FUNCTIONR, event->proc,
+ 					     event->proc->callstack[i].c_un.libfunc->name);
+ 			}
++
++			if (libsym->is_indirect) {
++				libsym->is_indirect = 0;
++				libsym->enter_addr
++					= (void *)gimme_arg(LT_TOF_FUNCTIONR,
++							    event->proc, -1);
++				libsym->name[strlen(libsym->name)
++					     - (sizeof(".IFUNC") - 1)] = 0;
++				debug(1, "Resolved indirect call to %s to %p",
++				      libsym->name, libsym->enter_addr);
++				libsym->plt_type = LS_TOPLT_NONE;
++				insert_breakpoint(event->proc,
++						  libsym->enter_addr,
++						  libsym, 1);
++			}
++
+ 			sbp = address2bpstruct(leader, event->e_un.brk_addr);
+ 			continue_after_breakpoint(event->proc, sbp);
+ 			return;
+diff -up ./sysdeps/linux-gnu/proc.c~ ./sysdeps/linux-gnu/proc.c
+--- ./sysdeps/linux-gnu/proc.c~	2012-02-23 22:25:05.844054740 +0100
++++ ./sysdeps/linux-gnu/proc.c	2012-02-28 22:06:42.338727506 +0100
+@@ -404,7 +404,21 @@ linkmap_add_cb(void *data) { //const cha
+ 			if (in_load_libraries(xptr->name, &lte, 1, &sym)) {
+ 				debug(2, "found symbol %s @ %lx, adding it.", xptr->name, sym.st_value);
+ 				addr = sym.st_value;
+-				add_library_symbol(addr, xptr->name, &library_symbols, LS_TOPLT_NONE, 0);
++				int indirect = (GELF_ST_TYPE(sym.st_info)
++						== STT_GNU_IFUNC);
++				char *xn = xptr->name;
++				if (indirect) {
++					if (asprintf(&xn, "%s.IFUNC",
++						     xptr->name) < 0)
++						continue;
++				}
++
++				add_library_symbol(addr, xn, &library_symbols,
++						   LS_TOPLT_NONE, 0);
++				if (indirect)
++					free(xn); /* ^^ makes a copy itself */
++				library_symbols->is_indirect = indirect;
++
+ 				xptr->found = 1;
+ 				insert_breakpoint(lm_add->proc, sym2addr(lm_add->proc, library_symbols), library_symbols, 1);
+ 			}
+diff -up ltrace-0.5/output.c\~ ltrace-0.5/output.c
+--- ltrace-0.5/output.c~	2012-02-28 22:16:09.184740385 +0100
++++ ltrace-0.5/output.c	2012-02-28 22:24:21.972751754 +0100
+@@ -198,7 +198,18 @@ output_left(enum tof type, struct proces
+ 	current_column += fprintf(output, "%s(", function_name);
+ #endif
+ 
+-	func = name2func(function_name);
++	const char *s = strrchr(function_name, '.');
++	if (s != NULL && strcmp(s, ".IFUNC") == 0) {
++		static struct function f = {
++			.return_type = ARGTYPE_ADDR,
++			.num_params = 0,
++		};
++		func = &f;
++
++	} else {
++		func = name2func(function_name);
++	}
++
+ 	if (!func) {
+ 		int i;
+ 		for (i = 0; i < 4; i++) {
+

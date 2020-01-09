@@ -1,0 +1,38 @@
+diff -urp ltrace-0.5/sysdeps/linux-gnu/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/trace.c	2011-08-04 22:30:16.724120925 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/trace.c	2011-08-04 22:33:03.367663730 +0200
+@@ -361,6 +361,8 @@ process_stopping_on_event(Event_Handler 
+ 	struct process_stopping_handler * self = (void *)super;
+ 	struct process * task = event->proc;
+ 	struct process * leader = task->leader;
++	struct breakpoint * sbp = self->breakpoint_being_enabled;
++	struct process * teb = self->task_enabling_breakpoint;
+ 
+ 	struct pid_task * task_info = get_task_info(&self->pids, task->pid);
+ 	if (task_info == NULL)
+@@ -378,8 +380,9 @@ process_stopping_on_event(Event_Handler 
+ 	case psh_stopping:
+ 		/* If everyone is stopped, singlestep.  */
+ 		if (each_task(leader, &task_stopped, NULL) == NULL) {
+-			if (ptrace(PTRACE_SINGLESTEP,
+-				   self->task_enabling_breakpoint->pid, 0, 0))
++			if (sbp->enabled)
++				disable_breakpoint(teb, sbp);
++			if (ptrace(PTRACE_SINGLESTEP, teb->pid, 0, 0))
+ 				perror("PTRACE_SINGLESTEP");
+ 			self->state = state = psh_singlestep;
+ 		}
+@@ -434,10 +437,10 @@ process_stopping_destroy(Event_Handler *
+ 
+ void continue_after_breakpoint(struct process *proc, struct breakpoint *sbp)
+ {
+-	if (sbp->enabled)
+-		disable_breakpoint(proc, sbp);
+ 	set_instruction_pointer(proc, sbp->addr);
+ 	if (sbp->enabled == 0) {
++		if (sbp->enabled)
++			disable_breakpoint(proc, sbp);
+ 		continue_process(proc->pid);
+ 	} else {
+ #if defined __sparc__  || defined __ia64___
+Только в ltrace-0.5-pm/sysdeps/linux-gnu: trace.c~

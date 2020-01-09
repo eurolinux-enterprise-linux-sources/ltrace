@@ -1,0 +1,344 @@
+diff -urp ltrace-0.5/ltrace.c ltrace-0.5-pm/ltrace.c
+--- ltrace-0.5/ltrace.c	2011-07-28 17:59:21.900918709 +0200
++++ ltrace-0.5-pm/ltrace.c	2011-07-28 19:09:01.908669266 +0200
+@@ -23,10 +23,41 @@
+ #endif
+ 
+ char *command = NULL;
+-struct process *list_of_processes = NULL;
+ 
+ int exiting = 0;		/* =1 if a SIGINT or SIGTERM has been received */
+ 
++static enum pcb_status
++stop_non_p_processes (struct process * proc, void * data)
++{
++	int stop = 1;
++
++	struct opt_p_t *it;
++	for (it = opt_p; it != NULL; it = it->next) {
++		struct process * p_proc = pid2proc(it->pid);
++		if (p_proc == NULL) {
++			printf("stop_non_p_processes: %d terminated?\n", it->pid);
++			continue;
++		}
++		if (p_proc == proc) {
++			stop = 0;
++			break;
++		}
++	}
++
++	if (stop) {
++		debug(2, "Sending SIGSTOP to process %u", proc->pid);
++		kill(proc->pid, SIGSTOP);
++	}
++
++	return pcb_cont;
++}
++
++static void
++signal_alarm(int sig) {
++	signal(SIGALRM, SIG_DFL);
++	each_process(NULL, &stop_non_p_processes, NULL);
++}
++
+ static void signal_alarm(int sig)
+ {
+ 	struct process *tmp = list_of_processes;
+diff -up ltrace-0.5/ltrace.c\~ ltrace-0.5/ltrace.c
+--- ltrace-0.5/ltrace.c~	2011-07-28 19:20:07.084473404 +0200
++++ ltrace-0.5/ltrace.c	2011-07-28 19:20:58.073587867 +0200
+@@ -58,29 +58,6 @@ signal_alarm(int sig) {
+ 	each_process(NULL, &stop_non_p_processes, NULL);
+ }
+ 
+-static void signal_alarm(int sig)
+-{
+-	struct process *tmp = list_of_processes;
+-
+-	signal(SIGALRM, SIG_DFL);
+-	while (tmp) {
+-		struct opt_p_t *tmp2 = opt_p;
+-		while (tmp2) {
+-			if (tmp->pid == tmp2->pid) {
+-				tmp = tmp->next;
+-				if (!tmp) {
+-					return;
+-				}
+-				break;
+-			}
+-			tmp2 = tmp2->next;
+-		}
+-		debug(2, "Sending SIGSTOP to process %u\n", tmp->pid);
+-		kill(tmp->pid, SIGSTOP);
+-		tmp = tmp->next;
+-	}
+-}
+-
+ static void signal_exit(int sig)
+ {
+ 	exiting = 1;
+Только в ltrace-0.5-pm: ltrace.c~
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-07-28 17:59:21.901918755 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 18:53:43.130524373 +0200
+@@ -167,7 +167,10 @@ struct opt_c_struct {
+ };
+ extern struct dict *dict_opt_c;
+ 
+-extern struct process *list_of_processes;
++enum pcb_status {
++	pcb_stop, /* The iteration should stop.  */
++	pcb_cont, /* The iteration should continue.  */
++};
+ 
+ extern void *instruction_pointer;
+ 
+@@ -217,6 +220,12 @@ extern int umovestr(struct process *proc
+ extern int ffcheck(void *maddr);
+ extern void *sym2addr(struct process *, struct library_symbol *);
+ extern struct process *pid2proc(int pid);
++extern void add_process(struct process * proc);
++extern void remove_process(struct process * proc);
++extern struct process *each_process(struct process * start,
++				    enum pcb_status (* cb)(struct process *,
++							   void * data),
++				    void * data);
+ 
+ #if 0				/* not yet */
+ extern int umoven(struct process *proc, void *addr, int len, void *laddr);
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2011-07-28 17:59:21.903918847 +0200
++++ ltrace-0.5-pm/proc.c	2011-07-28 19:16:48.459222562 +0200
+@@ -27,8 +27,7 @@ open_program(char *filename, pid_t pid, 
+ 	proc->breakpoints_enabled = -1;
+ 	proc->pid = pid;
+ 
+-	proc->next = list_of_processes;
+-	list_of_processes = proc;
++	add_process(proc);
+ 	breakpoints_init(proc, enable);
+ 
+ 	return proc;
+@@ -71,3 +70,50 @@ void open_forked_pid(pid_t pid, int earl
+ 	proc->breakpoints_enabled = 1;
+ #endif
+ }
++
++static struct process * list_of_processes = NULL;
++
++struct process *
++each_process(struct process * proc,
++	     enum pcb_status (* cb)(struct process * proc, void * data),
++	     void * data)
++{
++	struct process * it = proc ?: list_of_processes;
++	for (; it != NULL; ) {
++		/* Callback might call remove_process.  */
++		struct process * next = it->next;
++		if ((*cb) (it, data) == pcb_stop)
++			return it;
++		it = next;
++	}
++	return NULL;
++}
++void
++add_process(struct process * proc)
++{
++	proc->next = list_of_processes;
++	list_of_processes = proc;
++}
++
++void
++remove_process(struct process *proc)
++{
++	struct process *tmp, *tmp2;
++
++	if (list_of_processes == proc) {
++		tmp = list_of_processes;
++		list_of_processes = list_of_processes->next;
++		free(tmp);
++		return;
++	}
++	tmp = list_of_processes;
++	while (tmp->next) {
++		if (tmp->next == proc) {
++			tmp2 = tmp->next;
++			tmp->next = tmp->next->next;
++			free(tmp2);
++			return;
++		}
++		tmp = tmp->next;
++	}
++}
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-07-28 17:59:21.904918893 +0200
++++ ltrace-0.5-pm/process_event.c	2011-07-28 18:55:10.757338160 +0200
+@@ -28,7 +28,6 @@ static void process_sysret(struct event 
+ static void process_clone(struct event *event);
+ static void process_exec(struct event *event);
+ static void process_breakpoint(struct event *event);
+-static void remove_proc(struct process *proc);
+ 
+ static void callstack_push_syscall(struct process *proc, int sysnum);
+ static void callstack_push_symfunc(struct process *proc,
+@@ -125,12 +124,10 @@ static void process_clone(struct event *
+ 			p->state = STATE_IGNORED;
+ 		}
+ 		continue_process(p->pid);
+-		p->next = list_of_processes;
+-		list_of_processes = p;
++		add_process(p);
+ 	} else {
+ 		p->state = STATE_BEING_CREATED;
+-		p->next = list_of_processes;
+-		list_of_processes = p;
++		add_process(p);
+ 	}
+ 	continue_process(event->proc->pid);
+ }
+@@ -264,7 +261,7 @@ static void process_signal(struct event 
+ 		pid_t pid = event->proc->pid;
+ 		disable_all_breakpoints(event->proc);
+ 		untrace_pid(pid);
+-		remove_proc(event->proc);
++		remove_process(event->proc);
+ 		return;
+ 	}
+ 	if (event->proc->state != STATE_IGNORED) {
+@@ -281,7 +278,7 @@ static void process_exit(struct event *e
+ 		output_line(event->proc, "+++ exited (status %d) +++",
+ 			    event->e_un.ret_val);
+ 	}
+-	remove_proc(event->proc);
++	remove_process(event->proc);
+ }
+ 
+ static void process_exit_signal(struct event *event)
+@@ -290,31 +287,7 @@ static void process_exit_signal(struct e
+ 		output_line(event->proc, "+++ killed by %s +++",
+ 			    shortsignal(event->proc, event->e_un.signum));
+ 	}
+-	remove_proc(event->proc);
+-}
+-
+-static void remove_proc(struct process *proc)
+-{
+-	struct process *tmp, *tmp2;
+-
+-	debug(1, "Removing pid %u\n", proc->pid);
+-
+-	if (list_of_processes == proc) {
+-		tmp = list_of_processes;
+-		list_of_processes = list_of_processes->next;
+-		free(tmp);
+-		return;
+-	}
+-	tmp = list_of_processes;
+-	while (tmp->next) {
+-		if (tmp->next == proc) {
+-			tmp2 = tmp->next;
+-			tmp->next = tmp->next->next;
+-			free(tmp2);
+-			continue;
+-		}
+-		tmp = tmp->next;
+-	}
++	remove_process(event->proc);
+ }
+ 
+ static void process_syscall(struct event *event)
+@@ -338,7 +311,7 @@ static void process_exec(struct event * 
+ 
+ 	if (proc->state == STATE_IGNORED) {
+ 		untrace_pid(proc->pid);
+-		remove_proc(proc);
++		remove_process(proc);
+ 		return;
+ 	}
+ 	output_line(proc, "--- Called exec() ---");
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2011-07-28 17:59:21.895918479 +0200
++++ ltrace-0.5-pm/wait_for_something.c	2011-07-28 19:18:18.933983417 +0200
+@@ -79,6 +79,12 @@ static struct event event;
+ struct process *pid2proc(int pid);
+ void verify(int sig_status);
+ 
++static enum pcb_status
++first(struct process * proc, void * data)
++{
++	return pcb_stop;
++}
++
+ struct event *wait_for_something(void)
+ {
+ 	pid_t pid, child_pid;
+@@ -86,7 +92,7 @@ struct event *wait_for_something(void)
+ 	int tmp;
+ 	int stop_signal;
+ 
+-	if (!list_of_processes) {
++	if (!each_process(NULL, &first, NULL)) {
+ 		debug(1, "No more children");
+ 		exit(0);
+ 	}
+@@ -177,17 +183,15 @@ struct event *wait_for_something(void)
+ 	return &event;
+ }
+ 
+-struct process *pid2proc(pid_t pid)
++static enum pcb_status
++find_proc(struct process * proc, void * data)
+ {
+-	struct process *tmp;
+-
+-	tmp = list_of_processes;
+-	while (tmp) {
+-		if (pid == tmp->pid) {
+-			return tmp;
+-		}
+-		tmp = tmp->next;
+-	}
+-	return NULL;
++	pid_t pid = (pid_t)(uintptr_t)data;
++	return proc->pid == pid ? pcb_stop : pcb_cont;
+ }
+ 
++struct process *
++pid2proc(pid_t pid)
++{
++	return each_process(NULL, &find_proc, (void *)(uintptr_t)pid);
++}
+diff -up ltrace-0.5-pm/output.c\~ ltrace-0.5-pm/output.c
+--- ltrace-0.5-pm/output.c~	2011-07-28 18:52:13.397612425 +0200
++++ ltrace-0.5-pm/output.c	2011-07-28 19:31:19.850265644 +0200
+@@ -22,6 +22,16 @@
+ /* TODO FIXME XXX: include in ltrace.h: */
+ extern struct timeval current_time_spent;
+ 
++static enum pcb_status
++more_than_one(struct process * proc, void * data)
++{
++	int * countp = data;
++	if (++*countp > 1)
++		return pcb_stop;
++	else
++		return pcb_cont;
++}
++
+ struct dict *dict_opt_c = NULL;
+ 
+ static struct process *current_proc = 0;
+@@ -42,8 +52,11 @@ static void begin_of_line(enum tof type,
+ 	}
+ 	if ((output != stderr) && (opt_p || opt_f)) {
+ 		current_column += fprintf(output, "%u ", proc->pid);
+-	} else if (list_of_processes->next) {
+-		current_column += fprintf(output, "[pid %u] ", proc->pid);
++	} else {
++		int count = 0;
++		if (each_process(NULL, &more_than_one, &count))
++			current_column += fprintf(output, "[pid %u] ",
++						  proc->pid);
+ 	}
+ 	if (opt_r) {
+ 		struct timeval tv;

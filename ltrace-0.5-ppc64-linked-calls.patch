@@ -1,0 +1,55 @@
+diff -c ltrace-0.5/process_event.c\~ ltrace-0.5/process_event.c
+*** ltrace-0.5/process_event.c~	2012-04-12 02:17:37.000000000 -0400
+--- ltrace-0.5/process_event.c	2012-04-12 05:27:45.541511931 -0400
+***************
+*** 437,445 ****
+  
+  	debug(2, "event: breakpoint (%p)", event->e_un.brk_addr);
+  
+  	for (i = event->proc->callstack_depth - 1; i >= 0; i--) {
+! 		if (event->e_un.brk_addr ==
+! 		    event->proc->callstack[i].return_addr) {
+  
+  			struct library_symbol *libsym =
+  			    event->proc->callstack[i].c_un.libfunc;
+--- 437,445 ----
+  
+  	debug(2, "event: breakpoint (%p)", event->e_un.brk_addr);
+  
++ 	void *brk_addr = event->e_un.brk_addr;
+  	for (i = event->proc->callstack_depth - 1; i >= 0; i--) {
+! 		if (brk_addr == event->proc->callstack[i].return_addr) {
+  
+  			struct library_symbol *libsym =
+  			    event->proc->callstack[i].c_un.libfunc;
+***************
+*** 482,489 ****
+--- 482,509 ----
+  					calc_time_spent(event->proc);
+  				}
+  			}
++ 
+  			callstack_pop(event->proc);
+  
++ 			/* Pop also any other entries that seem like
++ 			 * they are linked to the current one: they
++ 			 * have the same return address, but were made
++ 			 * for different symbols.  This should only
++ 			 * happen for entry point tracing, i.e. for -x
++ 			 * everywhere, or -x and -e on PPC64.  */
++ 			while (event->proc->callstack_depth > 0) {
++ 				struct callstack_element *prev;
++ 				size_t d = event->proc->callstack_depth;
++ 				prev = &event->proc->callstack[d - 1];
++ 				if (prev->c_un.libfunc != libsym
++ 				    && prev->return_addr == brk_addr) {
++ 					callstack_pop(event->proc);
++ 					i--;
++ 				} else {
++ 					break;
++ 				}
++ 			}
++ 
+  			event->proc->return_addr = event->e_un.brk_addr;
+  			if (event->proc->state != STATE_IGNORED) {
+  				output_right(LT_TOF_FUNCTIONR, event->proc,

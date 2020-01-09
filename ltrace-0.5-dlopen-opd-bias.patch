@@ -1,0 +1,87 @@
+diff -up ./sysdeps/linux-gnu/proc.c~ ./sysdeps/linux-gnu/proc.c
+--- ./sysdeps/linux-gnu/proc.c~	2012-04-05 00:40:02.710313445 +0200
++++ ./sysdeps/linux-gnu/proc.c	2012-04-05 23:23:08.015243185 +0200
+@@ -510,8 +510,7 @@ bias(struct process *proc, GElf_Addr bas
+ }
+ 
+ static int
+-deref_opd(struct process *proc, GElf_Addr raddr,
+-	  GElf_Addr *retp, GElf_Addr a_bias)
++deref_opd(struct process *proc, GElf_Addr raddr, GElf_Addr *retp)
+ {
+ #ifdef __powerpc64__
+ 	if (!proc->mask_32bit) {
+@@ -519,7 +518,6 @@ deref_opd(struct process *proc, GElf_Add
+ 		    != sizeof(*retp))
+ 			return -1;
+ 
+-		*retp = bias(proc, *retp, a_bias);
+ 		return 0;
+ 	}
+ #endif
+@@ -534,11 +532,21 @@ add_library_breakpoint(struct cb_data *l
+ 	debug(2, "found symbol %s @ %lx, adding it.", name, sym->st_value);
+ 
+ 	GElf_Addr addr = bias(lm_add->proc, sym->st_value, lm_add->bias);
++	GElf_Addr orig = addr;
+-	if (deref_opd(lm_add->proc, addr, &addr, lm_add->bias) < 0) {
++	if (deref_opd(lm_add->proc, addr, &addr) < 0) {
+ 		fprintf(stderr, "Couldn't resolve OPD for %s\n", name);
+ 		return -1;
+ 	}
+ 
++	/* When reading OPD of the initial bunch of libraries, we have
++	 * already let the dynamic linker run (the _r_debug probe is
++	 * installed after we hit _start).  But later on, the probe
++	 * hits as soon as the linker calls _dl_debug_state, and
++	 * that's before the OPD is resolved.  For the former case, we
++	 * have to avoid applying bias.  */
++	if (addr != orig && !lm_add->is_base)
++		addr = bias(lm_add->proc, addr, lm_add->bias);
++
+ 	int indirect = GELF_ST_TYPE(sym->st_info) == STT_GNU_IFUNC;
+ 	char *xn = (char *)name;
+ 	if (indirect && asprintf(&xn, "%s.IFUNC", name) < 0)
+@@ -560,6 +567,8 @@ add_library_breakpoint(struct cb_data *l
+ static void
+ populate_dl(struct cb_data *lm_add, struct ltelf *lte)
+ {
++	const char *libname
++		= lte->soname != NULL ? lte->soname : lm_add->lib_name;
+ 	size_t i;
+ 	for (i = 0; i < lte->dynsym_count; ++i) {
+ 		GElf_Sym sym;
+@@ -573,8 +582,6 @@ populate_dl(struct cb_data *lm_add, stru
+ 			continue;
+ 
+ 		const char *name = lte->dynstr + sym.st_name;
+-		const char *libname
+-			= lte->soname != NULL ? lte->soname : lm_add->lib_name;
+ 		char *rename;
+ 		if (asprintf(&rename, "%s@%s", name, libname) < 0)
+ 			rename = (char *)name;
+@@ -602,7 +609,6 @@ static void
+ linkmap_add_cb(void *data) { //const char *lib_name, ElfW(Addr) addr) {
+ 	int i = 0;
+ 	struct cb_data *lm_add = data;
+-	struct ltelf lte;
+ 
+ 	debug(1, "linkmap_add_cb");
+ 
+@@ -622,6 +628,7 @@ linkmap_add_cb(void *data) { //const cha
+ 	debug(2, "New libdl loaded library found: %s\n", lm_add->lib_name);
+ 
+ 	if (library_num < MAX_LIBRARY) {
++		struct ltelf lte;
+ 		library[library_num++] = strdup(lm_add->lib_name);
+ 		memset(&lte, 0, sizeof(struct ltelf));
+ 
+@@ -726,7 +733,7 @@ linkmap_init(struct process *proc)
+ 	}
+ 
+ 	GElf_Addr faddr;
+-	if (deref_opd(proc, rdbg.r_brk, &faddr, 0) < 0) {
++	if (deref_opd(proc, rdbg.r_brk, &faddr) < 0) {
+ 		fprintf(stderr, "Can't load r_brk address from OPD\n");
+ 		return -1;
+ 	}

@@ -1,0 +1,185 @@
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-07-28 21:10:06.286058202 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 22:39:03.787748633 +0200
+@@ -158,6 +158,7 @@ struct process {
+ };
+ 
+ struct event {
++	struct event * next;
+ 	struct process *proc;
+ 	enum {
+ 		LT_EV_UNKNOWN,
+@@ -194,7 +195,20 @@ enum pcb_status {
+ 
+ extern void *instruction_pointer;
+ 
++/* Events  */
++enum ecb_status {
++	ecb_cont, /* The iteration should continue.  */
++	ecb_yield, /* The iteration should stop, yielding this
++		    * event.  */
++	ecb_deque, /* Like ecb_stop, but the event should be removed
++		    * from the queue.  */
++};
++extern struct event * each_qd_event(enum ecb_status (* cb)(struct event * ev,
++							   void * data),
++				    void * data);
++extern void enque_event(struct event * event);
+ extern struct event *wait_for_something(void);
++
+ extern void process_event(struct event *event);
+ extern pid_t execute_program(const char * command, char ** argv);
+ extern int display_arg(enum tof type, struct process *proc, int arg_num,
+Только в ltrace-0.5-pm: ltrace.h~
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2011-07-28 21:10:06.288058275 +0200
++++ ltrace-0.5-pm/proc.c	2011-07-28 22:40:05.274863127 +0200
+@@ -161,6 +161,23 @@ clear_leader(struct process * proc, void
+ 	return pcb_cont;
+ }
+ 
++static enum ecb_status
++event_for_proc(struct event * event, void * data)
++{
++	if (event->proc == data)
++		return ecb_deque;
++	else
++		return ecb_cont;
++}
++
++static void
++delete_events_for(struct process * proc)
++{
++	struct event * event;
++	while ((event = each_qd_event(&event_for_proc, proc)) != NULL)
++		free(event);
++}
++
+ void
+ remove_process(struct process *proc)
+ {
+@@ -172,6 +189,7 @@ remove_process(struct process *proc)
+ 	if (list_of_processes == proc) {
+ 		tmp = list_of_processes;
+ 		list_of_processes = list_of_processes->next;
++		delete_events_for(tmp);
+ 		free(tmp);
+ 		return;
+ 	}
+@@ -180,6 +198,7 @@ remove_process(struct process *proc)
+ 		if (tmp->next == proc) {
+ 			tmp2 = tmp->next;
+ 			tmp->next = tmp->next->next;
++			delete_events_for(tmp2);
+ 			free(tmp2);
+ 			return;
+ 		}
+Только в ltrace-0.5-pm: proc.c~
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2011-07-28 21:10:06.293058461 +0200
++++ ltrace-0.5-pm/wait_for_something.c	2011-07-28 22:51:26.938284906 +0200
+@@ -10,6 +10,7 @@
+ #include <signal.h>
+ #include <string.h>
+ #include <stdint.h>
++#include <assert.h>
+ 
+ #include "ltrace.h"
+ #include "options.h"
+@@ -79,19 +80,95 @@ static struct event event;
+ struct process *pid2proc(int pid);
+ void verify(int sig_status);
+ 
++/* A queue of events that we missed while enabling the
++ * breakpoint in one of tasks.  */
++static struct event * delayed_events = NULL;
++static struct event * end_delayed_events = NULL;
++
+ static enum pcb_status
+ first(struct process * proc, void * data)
+ {
+ 	return pcb_stop;
+ }
+ 
++void
++enque_event(struct event * event)
++{
++	struct event * ne = malloc(sizeof(*ne));
++	if (ne == NULL) {
++		perror("event will be missed: malloc");
++		return;
++	}
++
++	*ne = *event;
++	ne->next = NULL;
++	if (end_delayed_events == NULL) {
++		assert(delayed_events == NULL);
++		end_delayed_events = delayed_events = ne;
++	}
++	else {
++		assert(delayed_events != NULL);
++		end_delayed_events = end_delayed_events->next = ne;
++	}
++}
++
++struct event *
++each_qd_event(enum ecb_status (*pred)(struct event *, void *), void * data)
++{
++	struct event * prev = delayed_events;
++	struct event * event;
++	for (event = prev; event != NULL; ) {
++		switch ((*pred)(event, data)) {
++		case ecb_cont:
++			prev = event;
++			event = event->next;
++			continue;
++
++		case ecb_deque:
++			if (end_delayed_events == event)
++				end_delayed_events = prev;
++			if (delayed_events == event)
++				delayed_events = event->next;
++			else
++				prev->next = event->next;
++			if (delayed_events == NULL)
++				end_delayed_events = NULL;
++			/* fall-through */
++
++		case ecb_yield:
++			return event;
++		}
++	}
++
++	return NULL;
++}
++
++static enum ecb_status
++event_process_not_reenabling(struct event * event, void * data)
++{
++	return ecb_deque;
++}
++
++static struct event *
++next_qd_event(void)
++{
++	return each_qd_event(&event_process_not_reenabling, NULL);
++}
++
+ struct event *wait_for_something(void)
+ {
+ 	pid_t pid, child_pid;
+ 	int status;
+ 	int tmp;
+ 	int stop_signal;
+ 
++	struct event * ev;
++	if ((ev = next_qd_event()) != NULL) {
++		event = *ev;
++		free(ev);
++		return &event;
++	}
++
+ 	if (!each_process(NULL, &first, NULL)) {
+ 		debug(1, "No more children");
+ 		exit(0);
+Только в ltrace-0.5-pm: wait_for_something.c~

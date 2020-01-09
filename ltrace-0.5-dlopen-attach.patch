@@ -1,0 +1,189 @@
+diff -urp ltrace-0.5/elf.h ltrace-0.5-pm/elf.h
+--- ltrace-0.5/elf.h	2012-04-05 00:31:04.223892255 +0200
++++ ltrace-0.5-pm/elf.h	2012-04-04 23:57:13.632175512 +0200
+@@ -14,6 +14,7 @@ struct ltelf {
+ 	size_t dynsym_count;
+ 	const char *dynstr;
+ 	const char *soname;
++	const char *interp;
+ 	GElf_Addr plt_addr;
+ 	size_t plt_size;
+ 	Elf_Data *relplt;
+diff -urp ltrace-0.5/elf.c ltrace-0.5-pm/elf.c
+--- ltrace-0.5/elf.c	2012-04-04 22:25:49.664789040 +0200
++++ ltrace-0.5-pm/elf.c	2012-04-04 22:06:18.628791226 +0200
+@@ -395,6 +395,21 @@ do_init_elf(struct ltelf *lte, const cha
+ 
+ 	lte->soname = soname > 0 ? lte->dynstr + soname : NULL;
+ 
++	/* INTERP reading code taken from systemtap.  */
++	for (i = 0; ; i++) {
++		GElf_Phdr phdr;
++		if (gelf_getphdr(lte->elf, i, &phdr) == NULL)
++			break;
++		if (phdr.p_type == PT_INTERP) {
++			size_t maxsize;
++			char *filedata = elf_rawfile(lte->elf, &maxsize);
++
++			if (filedata != NULL && phdr.p_offset < maxsize)
++				lte->interp = filedata + phdr.p_offset;
++			break;
++		}
++	}
++
+ 	if (!relplt_addr || !lte->plt_addr) {
+ 		debug(1, "%s has no PLT relocations", filename);
+ 		lte->relplt = NULL;
+@@ -656,12 +656,10 @@ struct library_symbol *read_elf(struct p
+ 		return NULL;
+ 	memcpy(&main_lte, lte, sizeof(struct ltelf));
+ 
+-	if (opt_p && opt_p->pid > 0) {
+-		linkmap_init(proc, lte);
+-		proc->libdl_hooked = 1;
+-	}
+-
+ 	proc->e_machine = lte->ehdr.e_machine;
++	proc->dyn_addr = (void *)lte->dyn_addr;
++	if (proc->interp == NULL)
++		proc->interp = strdup(lte->interp);
+ 	for (i = 0; i < library_num; ++i)
+ 		if (do_init_elf(&lte[i + 1], library[i]))
+ 			error(EXIT_FAILURE, errno, "Can't open \"%s\"",
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2012-04-04 22:25:49.674789346 +0200
++++ ltrace-0.5-pm/ltrace.h	2012-04-04 21:58:21.884272445 +0200
+@@ -142,6 +142,7 @@ struct process {
+ 	Process_State state;
+ 	struct process *parent; /* needed by STATE_BEING_CREATED */
+ 	char *filename;
++	char *interp;
+ 	pid_t pid;
+ 
+ 	/* Dictionary of breakpoints (which is a mapping
+@@ -170,6 +170,7 @@ struct process {
+ 	void *instruction_pointer;
+ 	void *stack_pointer;	/* To get return addr, args... */
+ 	void *return_addr;
++	void *dyn_addr;
+ 	void *arch_ptr;
+ 	short e_machine;
+ 	short need_to_reinitialize_breakpoints;
+@@ -320,7 +321,7 @@ extern size_t umovebytes (struct process
+ 			  size_t count);
+ extern int ffcheck(void *maddr);
+ extern void *sym2addr(struct process *, struct library_symbol *);
+-extern int linkmap_init(struct process *, struct ltelf *);
++extern int linkmap_init(struct process *);
+ 
+ extern void arch_check_dbg(struct process *proc);
+ extern int task_kill (pid_t pid, int sig);
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2012-04-04 22:25:49.644788428 +0200
++++ ltrace-0.5-pm/proc.c	2012-04-04 22:23:08.410241637 +0200
+@@ -131,9 +131,12 @@ open_pid(pid_t pid, int verbose)
+ 	struct process * leader;
+ start:
+ 	leader = pid2proc(pid)->leader;
+-	enable_all_breakpoints(leader);
++	reinitialize_breakpoints(leader);
+ 
+-	each_task(pid2proc(pid)->leader, start_one_pid, NULL);
++	linkmap_init(leader);
++	leader->libdl_hooked = 1;
++
++	each_task(leader, start_one_pid, NULL);
+ }
+ 
+ void open_forked_pid(pid_t pid, int early)
+diff -urp ltrace-0.5/sysdeps/linux-gnu/proc.c ltrace-0.5-pm/sysdeps/linux-gnu/proc.c
+--- ltrace-0.5/sysdeps/linux-gnu/proc.c	2012-04-04 22:25:49.694789956 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/proc.c	2012-04-04 22:11:35.039047247 +0200
+@@ -302,19 +302,19 @@ dyn_fetcher(struct process *proc))(struc
+ }
+ 
+ static int
+-find_dynamic_entry_addr(struct process *proc, void *pvAddr,
+-			int d_tag, void **addr)
++find_dynamic_entry_addr(struct process *proc, int d_tag, void **addr)
+ {
+ 	debug(1, "find_dynamic_entry()");
+ 
+-	if (addr ==	NULL || pvAddr == NULL || d_tag < 0 || d_tag > DT_NUM) {
++	if (addr == NULL || proc->dyn_addr == NULL
++	    || d_tag < 0 || d_tag > DT_NUM)
+ 		return -1;
+-	}
+ 
+ 	int i = 0;
++	void *dyn_addr = proc->dyn_addr;
+ 	while (1) {
+ 		Elf64_Dyn entry;
+-		if (dyn_fetcher(proc)(proc, &pvAddr, &entry) < 0
++		if (dyn_fetcher(proc)(proc, &dyn_addr, &entry) < 0
+ 		    || entry.d_tag == DT_NULL
+ 		    || i++ > ELF_MAX_SEGMENTS) {
+ 			debug(2, "Couldn't find address for dtag!");
+@@ -331,7 +331,6 @@ find_dynamic_entry_addr(struct process *
+ 
+ struct cb_data {
+ 	const char *lib_name;
+-	struct ltelf *lte;
+ 	GElf_Addr bias;
+ 	struct process *proc;
+ 	int is_base;
+@@ -694,6 +695,12 @@ hook_libdl_cb(void *data) {
+ 
+ 	const char *lib_name = hook_data->lib_name;
+ 
++	if (hook_data->proc->interp != NULL
++	    && strcmp(hook_data->proc->interp, lib_name) != 0) {
++		linkmap_add_cb(hook_data);
++		return;
++	}
++
+ 	if (library_num < MAX_LIBRARY) {
+ 		library[library_num++] = strdup(lib_name);
+ 	}
+@@ -705,11 +704,11 @@ hook_libdl_cb(void *data) {
+ }
+ 
+ int
+-linkmap_init(struct process *proc, struct ltelf *lte) {
++linkmap_init(struct process *proc)
++{
+ 	debug(1, "linkmap_init()");
+ 
+-	if (find_dynamic_entry_addr(proc, (void *)lte->dyn_addr,
+-				    DT_DEBUG, &proc->debug) == -1) {
++	if (find_dynamic_entry_addr(proc, DT_DEBUG, &proc->debug) == -1) {
+ 		debug(2, "Couldn't find debug structure!");
+ 		return -1;
+ 	}
+@@ -729,9 +728,10 @@ linkmap_init(struct process *proc, struc
+ 	add_library_symbol(faddr, "", &library_symbols, LS_TOPLT_NONE, 0);
+ 	insert_breakpoint(proc, sym2addr(proc, library_symbols), library_symbols, 1);
+ 
+-	struct cb_data data = {
+-		.lte = lte,
+-	};
++	struct cb_data data = {
++		.proc = proc,
++		.is_base = 1,
++	};
+ 	crawl_linkmap(proc, &rdbg, hook_libdl_cb, &data);
+ 	proc->debug_state = RT_ADD | LT_RD_BASE;
+ 
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2012-04-04 22:25:49.644788428 +0200
++++ ltrace-0.5-pm/wait_for_something.c	2012-04-04 22:07:00.000640102 +0200
+@@ -217,7 +217,7 @@ struct event *wait_for_something(void)
+ 	if (leader == event.proc) {
+ 		if (!event.proc->libdl_hooked) {
+ 			/* debug struct may not have been written yet.. */
+-			if (linkmap_init(event.proc, &main_lte) == 0) {
++			if (linkmap_init(event.proc) == 0) {
+ 				event.proc->libdl_hooked = 1;
+ 			}
+ 		}
+Только в ltrace-0.5-pm/: wait_for_something.o

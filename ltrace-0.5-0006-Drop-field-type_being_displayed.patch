@@ -1,0 +1,26 @@
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-07-28 16:51:18.500807031 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 16:50:23.517975552 +0200
+@@ -133,9 +133,6 @@ struct process {
+ 	short e_machine;
+ 	short need_to_reinitialize_breakpoints;
+ 
+-	/* output: */
+-	enum tof type_being_displayed;
+-
+ 	struct process *next;
+ };
+ 
+Только в ltrace-0.5: ltrace.h~
+diff -urp ltrace-0.5/output.c ltrace-0.5-pm/output.c
+--- ltrace-0.5/output.c	2011-07-28 16:51:36.036708854 +0200
++++ ltrace-0.5-pm/output.c	2011-07-28 16:50:23.531976265 +0200
+@@ -176,7 +176,6 @@ output_left(enum tof type, struct proces
+ 	}
+ 	current_proc = proc;
+ 	current_depth = proc->callstack_depth;
+-	proc->type_being_displayed = type;
+ 	begin_of_line(type, proc);
+ #ifdef USE_DEMANGLE
+ 	current_column +=
+Только в ltrace-0.5: output.c~

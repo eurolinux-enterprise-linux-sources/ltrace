@@ -1,0 +1,18 @@
+commit 43d1de94c304f61f20d542a031bee907cd98c2e6
+Author: Petr Machata <pmachata@redhat.com>
+Date:   Thu Aug 11 15:09:05 2011 +0200
+
+    Fix compilation
+
+diff --git a/testsuite/ltrace.minor/trace-clone.c b/testsuite/ltrace.minor/trace-clone.c
+index a1ccb22..6e1c809 100644
+--- a/testsuite/ltrace.minor/trace-clone.c
++++ b/testsuite/ltrace.minor/trace-clone.c
+@@ -4,6 +4,7 @@
+ 
+    This file was written by Yao Qi <qiyao@cn.ibm.com>.  */
+ 
++#define _GNU_SOURCE
+ #include <stdio.h>
+ #include <sys/types.h>
+ #include <stdlib.h>

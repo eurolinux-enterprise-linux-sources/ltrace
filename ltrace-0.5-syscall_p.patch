@@ -1,0 +1,78 @@
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-09-09 20:04:47.604041725 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-09-09 18:33:16.013916407 +0200
+@@ -273,6 +273,7 @@ extern void disable_breakpoint(struct pr
+ extern int syscall_p(struct process *proc, int status, int *sysnum);
+ extern void continue_process(pid_t pid);
+ extern void continue_after_signal(pid_t pid, int signum);
++extern void continue_after_breakpoint(struct process *proc, struct breakpoint *sbp);
+ extern void ltrace_exiting(void);
+ extern void continue_enabling_breakpoint(struct process *proc,
+ 					 struct breakpoint *sbp);
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-09-09 20:04:14.639040977 +0200
++++ ltrace-0.5-pm/process_event.c	2011-09-09 19:54:27.303027557 +0200
+@@ -381,7 +382,7 @@ static void process_sysret(struct event 
+ static void process_breakpoint(struct event *event)
+ {
+ 	int i, j;
+-	struct breakpoint *sbp, *nxtbp;
++	struct breakpoint *sbp;
+ 	struct process *leader = event->proc->leader;
+ 
+ 	/* The leader has terminated.  */
+diff -urp ltrace-0.5/sysdeps/linux-gnu/ia64/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/ia64/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/ia64/trace.c	2011-09-09 20:03:31.889039990 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/ia64/trace.c	2011-09-09 20:11:00.688050233 +0200
+@@ -96,7 +96,9 @@ int syscall_p(struct process *proc, int 
+ 			*sysnum = r15;
+ 			if (proc->callstack_depth > 0 &&
+ 			    proc->callstack[proc->callstack_depth -
+-					    1].is_syscall) {
++					    1].is_syscall &&
++			    proc->callstack[proc->callstack_depth -
++					    1].c_un.syscall == *sysnum) {
+ 				return 2;
+ 			}
+ 			return 1;
+diff -urp ltrace-0.5/sysdeps/linux-gnu/ppc/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/ppc/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/ppc/trace.c	2011-09-09 20:03:54.242040492 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/ppc/trace.c	2011-09-09 20:10:36.504049672 +0200
+@@ -47,7 +47,9 @@ int syscall_p(struct process *proc, int 
+ 					sizeof(long) * PT_R0, 0);
+ 			if (proc->callstack_depth > 0
+ 			    && proc->callstack[proc->callstack_depth -
+-					       1].is_syscall) {
++					       1].is_syscall
++			    && proc->callstack[proc->callstack_depth -
++					       1].c_un.syscall == *sysnum) {
+ 				return 2;
+ 			}
+ 			return 1;
+diff -urp ltrace-0.5/sysdeps/linux-gnu/s390/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/s390/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/s390/trace.c	2011-09-09 20:03:12.607039558 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/s390/trace.c	2011-09-09 20:11:31.655050920 +0200
+@@ -151,7 +153,9 @@ int syscall_p(struct process *proc, int 
+ 
+ 		/* System call was encountered... */
+ 		if (proc->callstack_depth > 0 &&
+-		    proc->callstack[proc->callstack_depth - 1].is_syscall) {
++		    proc->callstack[proc->callstack_depth - 1].is_syscall &&
++		    proc->callstack[proc->callstack_depth -
++				    1].c_un.syscall == *sysnum) {
+ 			return 2;
+ 		} else {
+ 			return 1;
+diff -urp ltrace-0.5/sysdeps/linux-gnu/x86_64/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/x86_64/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/x86_64/trace.c	2011-09-09 20:02:55.826039179 +0200
++++ ltrace-0.5-pm/sysdeps/linux-gnu/x86_64/trace.c	2011-09-09 19:52:26.992024814 +0200
+@@ -41,7 +41,8 @@ int syscall_p(struct process *proc, int 
+ 		*sysnum = ptrace(PTRACE_PEEKUSER, proc->pid, 8 * ORIG_RAX, 0);
+ 
+ 		if (proc->callstack_depth > 0 &&
+-		    proc->callstack[proc->callstack_depth - 1].is_syscall) {
++		    proc->callstack[proc->callstack_depth - 1].is_syscall &&
++		    proc->callstack[proc->callstack_depth - 1].c_un.syscall == *sysnum) {
+ 			return 2;
+ 		}
+ 

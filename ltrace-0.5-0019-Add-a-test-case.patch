@@ -1,0 +1,95 @@
+From 15f83677401cbeea9309300569c0f2e9e6f57fa7 Mon Sep 17 00:00:00 2001
+From: Petr Machata <pmachata@redhat.com>
+Date: Sat, 9 Jul 2011 12:17:59 +0200
+Subject: [PATCH 19/19] Add a test case
+
+---
+ testsuite/ltrace.main/main-threaded.c   |   29 +++++++++++++++++++++++
+ testsuite/ltrace.main/main-threaded.exp |   39 +++++++++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+), 0 deletions(-)
+ create mode 100644 testsuite/ltrace.main/main-threaded.c
+ create mode 100644 testsuite/ltrace.main/main-threaded.exp
+
+diff --git a/testsuite/ltrace.main/main-threaded.c b/testsuite/ltrace.main/main-threaded.c
+new file mode 100644
+index 0000000..a183966
+--- /dev/null
++++ b/testsuite/ltrace.main/main-threaded.c
+@@ -0,0 +1,29 @@
++#include <pthread.h>
++
++extern void print (char *);
++
++#define	PRINT_LOOP	10
++
++void *
++th_main (void *arg)
++{
++  int i;
++  for (i=0; i<PRINT_LOOP; i++)
++    print (arg);
++}
++
++int
++main ()
++{
++  pthread_t thread1;
++  pthread_t thread2;
++  pthread_t thread3;
++  pthread_create (&thread1, NULL, th_main, "aaa");
++  pthread_create (&thread2, NULL, th_main, "bbb");
++  pthread_create (&thread3, NULL, th_main, "ccc");
++  pthread_join (thread1, NULL);
++  pthread_join (thread2, NULL);
++  pthread_join (thread3, NULL);
++  return 0;
++}
++
+diff --git a/testsuite/ltrace.main/main-threaded.exp b/testsuite/ltrace.main/main-threaded.exp
+new file mode 100644
+index 0000000..0157797
+--- /dev/null
++++ b/testsuite/ltrace.main/main-threaded.exp
+@@ -0,0 +1,39 @@
++# This file was written by Yao Qi <qiyao@cn.ibm.com>.
++
++set testfile "main-threaded"
++set srcfile ${testfile}.c
++set binfile ${testfile}
++set libfile "main-lib"
++set libsrc $srcdir/$subdir/$libfile.c
++set lib_sl $objdir/$subdir/lib$testfile.so
++
++
++if [get_compiler_info $binfile] {
++  return -1
++}
++
++verbose "compiling source file now....."
++if { [ltrace_compile_shlib $libsrc $lib_sl debug ] != "" 
++  || [ltrace_compile $srcdir/$subdir/$srcfile $objdir/$subdir/$binfile executable [list debug shlib=$lib_sl ldflags=-pthread] ] != ""} {
++  send_user "Testcase compile failed, so all tests in this file will automatically fail.\n"
++}
++
++# set options for ltrace.
++ltrace_options "-l" "$lib_sl" "-f"
++
++# Run PUT for ltarce.
++set exec_output [ltrace_runtest $objdir/$subdir $objdir/$subdir/$binfile]
++
++# Check the output of this program.
++verbose "ltrace runtest output: $exec_output\n"
++if [regexp {ELF from incompatible architecture} $exec_output] {
++	fail "32-bit ltrace can not perform on 64-bit PUTs and rebuild ltrace in 64 bit mode!"
++	return 
++} elseif [ regexp {Couldn't get .hash data} $exec_output ] {
++	fail "Couldn't get .hash data!"
++	return
++}
++
++# Verify the output by checking numbers of print in main-threaded.ltrace.
++set pattern "print"
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 30
+-- 
+1.7.4.4
+

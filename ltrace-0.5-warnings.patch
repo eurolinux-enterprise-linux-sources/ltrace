@@ -1,0 +1,185 @@
+diff -up ./elf.c~ ./elf.c
+--- ./elf.c~	2012-04-12 20:08:40.244402168 +0200
++++ ./elf.c	2012-04-12 20:20:11.205551376 +0200
+@@ -12,6 +12,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <assert.h>
++#include <inttypes.h>
+ 
+ #include "ltrace.h"
+ #include "elf.h"
+@@ -355,7 +356,8 @@ do_init_elf(struct ltelf *lte, const cha
+ 			if (shdr.sh_entsize != 0
+ 			    && shdr.sh_entsize != 4) {
+ 				error(EXIT_FAILURE, 0,
+-				      ".gnu.hash sh_entsize in \"%s\" should be 4, but is %ld",
++				      ".gnu.hash sh_entsize in \"%s\" "
++				      "should be 4, but is %"PRId64,
+ 				      filename, shdr.sh_entsize);
+ 			}
+ 
+@@ -572,9 +574,9 @@ in_load_libraries(const char *name, stru
+ 	if (!count)
+ 		return 1;
+ 
+-	hash = elf_hash((const unsigned char *)name);
++	hash = elf_hash(name);
+ #ifdef SHT_GNU_HASH
+-	gnu_hash = elf_gnu_hash((const unsigned char *)name);
++	gnu_hash = elf_gnu_hash(name);
+ #endif
+ 	for (i = 0; i < count; ++i) {
+ 		if (lte[i].hash == NULL)
+@@ -672,7 +674,7 @@ struct library_symbol *read_elf(struct p
+ 	memcpy(&main_lte, lte, sizeof(struct ltelf));
+ 
+ 	proc->e_machine = lte->ehdr.e_machine;
+-	proc->dyn_addr = (void *)lte->dyn_addr;
++	proc->dyn_addr = (void *)(uintptr_t)lte->dyn_addr;
+ 	if (proc->interp == NULL)
+ 		proc->interp = strdup(lte->interp);
+ 	for (i = 0; i < library_num; ++i)
+@@ -747,8 +749,9 @@ struct library_symbol *read_elf(struct p
+ 			if (xptr->name && strcmp(xptr->name, name) == 0) {
+ 				/* FIXME: Should be able to use &library_symbols as above.  But
+ 				   when you do, none of the real library symbols cause breaks. */
+-				add_library_symbol(opd2addr(lte, (void*)addr),
+-						   name, lib_tail, LS_TOPLT_NONE, 0);
++				addr = opd2addr(lte, (void*)(uintptr_t)addr);
++				add_library_symbol(addr, name, lib_tail,
++						   LS_TOPLT_NONE, 0);
+ 				xptr->found = 1;
+ 				break;
+ 			}
+@@ -778,7 +781,7 @@ struct library_symbol *read_elf(struct p
+ 	}
+ 
+ 	if (lte->ehdr.e_entry != 0)
+-		*entryp = opd2addr(lte, (void *)lte->ehdr.e_entry);
++		*entryp = opd2addr(lte, (void *)(uintptr_t)lte->ehdr.e_entry);
+ 
+ 	for (xptr = opt_x_loc; xptr; xptr = xptr->next)
+ 		if ( ! xptr->found) {
+diff -up ./sysdeps/linux-gnu/ppc/plt.c~ ./sysdeps/linux-gnu/ppc/plt.c
+--- ./sysdeps/linux-gnu/ppc/plt.c~	2012-04-12 20:08:39.564381354 +0200
++++ ./sysdeps/linux-gnu/ppc/plt.c	2012-04-12 20:14:37.545338575 +0200
+@@ -13,12 +13,12 @@ GElf_Addr arch_plt_sym_val(struct ltelf
+ 
+ void *sym2addr(struct process *proc, struct library_symbol *sym)
+ {
+-	long addr = sym->enter_addr;
++	long addr = (uintptr_t)sym->enter_addr;
+ 	long pt_ret;
+ 
+ 	debug(2, "sym2addr: sym=%s, pid=%d, enter_addr=%p", sym->name, proc->pid, addr);
+ 	if (sym->plt_type != LS_TOPLT_POINT) {
+-		return addr;
++		return (void *)(uintptr_t)addr;
+ 	}
+ 
+ 	if (proc->pid == 0) {
+@@ -51,12 +51,15 @@ void *sym2addr(struct process *proc, str
+ 		return 0;
+ 	}
+ 
++#ifdef __powerpc64__
+ 	if (proc->mask_32bit) {
+ 		// Assume big-endian.
+-		addr = (void *)((pt_ret >> 32) & 0xffffffff);
+-	} else {
+-		addr = (void *)pt_ret;
++		addr = (uintptr_t)(void *)((pt_ret >> 32) & 0xffffffff);
++	} else
++#endif
++	{
++		addr = (uintptr_t)(void *)pt_ret;
+ 	}
+ 
+-	return addr;
++	return (void *)addr;
+ }
+diff -up ./sysdeps/linux-gnu/proc.c~ ./sysdeps/linux-gnu/proc.c
+--- ./sysdeps/linux-gnu/proc.c~	2012-04-12 20:08:40.274403087 +0200
++++ ./sysdeps/linux-gnu/proc.c	2012-04-12 20:11:52.050273037 +0200
+@@ -322,7 +322,7 @@ find_dynamic_entry_addr(struct process *
+ 		}
+ 
+ 		if (entry.d_tag == d_tag) {
+-			*addr = (void *)entry.d_un.d_val;
++			*addr = (void *)(uintptr_t)entry.d_un.d_val;
+ 			debug(2, "found address: %p, dtag %d", *addr, d_tag);
+ 			return 0;
+ 		}
+@@ -360,7 +360,8 @@ struct lt_link_map_64 LT_LINK_MAP(64);
+ static int
+ fetch_lm64(struct process *proc, Elf64_Addr addr, struct lt_link_map_64 *ret)
+ {
+-	if (umovebytes(proc, (void *)addr, ret, sizeof(*ret)) != sizeof(*ret))
++	if (umovebytes(proc, (void *)(uintptr_t)addr, ret,
++		       sizeof(*ret)) != sizeof(*ret))
+ 		return -1;
+ 	return 0;
+ }
+@@ -369,7 +370,8 @@ static int
+ fetch_lm32(struct process *proc, Elf64_Addr addr, struct lt_link_map_64 *ret)
+ {
+ 	struct lt_link_map_32 lm;
+-	if (umovebytes(proc, (void *)addr, &lm, sizeof(lm)) != sizeof(lm))
++	if (umovebytes(proc, (void *)(uintptr_t)addr, &lm,
++		       sizeof(lm)) != sizeof(lm))
+ 		return -1;
+ 
+ 	ret->l_addr = lm.l_addr;
+@@ -406,7 +408,8 @@ struct lt_r_debug_64 LT_R_DEBUG(64);
+ static int
+ fetch_rd64(struct process *proc, Elf64_Addr addr, struct lt_r_debug_64 *ret)
+ {
+-	if (umovebytes(proc, (void *)addr, ret, sizeof(*ret)) != sizeof(*ret))
++	if (umovebytes(proc, (void *)(uintptr_t)addr, ret,
++		       sizeof(*ret)) != sizeof(*ret))
+ 		return -1;
+ 	return 0;
+ }
+@@ -415,7 +418,8 @@ static int
+ fetch_rd32(struct process *proc, Elf64_Addr addr, struct lt_r_debug_64 *ret)
+ {
+ 	struct lt_r_debug_32 rd;
+-	if (umovebytes(proc, (void *)addr, &rd, sizeof(rd)) != sizeof(rd))
++	if (umovebytes(proc, (void *)(uintptr_t)addr, &rd,
++		       sizeof(rd)) != sizeof(rd))
+ 		return -1;
+ 
+ 	ret->r_version = rd.r_version;
+@@ -461,7 +465,7 @@ crawl_linkmap(struct process *proc, stru
+ 		}
+ 
+ 		char lib_name[BUFSIZ];
+-		umovebytes(proc, (void *)rlm.l_name,
++		umovebytes(proc, (void *)(uintptr_t)rlm.l_name,
+ 			   lib_name, sizeof(lib_name));
+ 
+ 		if (lib_name[0] == '\0') {
+@@ -490,7 +494,7 @@ load_debug_struct(struct process *proc,
+ {
+ 	debug(1, "load_debug_struct");
+ 
+-	if (rdebug_fetcher(proc)(proc, (Elf64_Addr)proc->debug, ret) < 0) {
++	if (rdebug_fetcher(proc)(proc, (uintptr_t)proc->debug, ret) < 0) {
+ 		debug(2, "This process does not have a debug structure!\n");
+ 		return -1;
+ 	}
+diff -up ltrace-0.5/elf.c\~ ltrace-0.5/elf.c
+--- ltrace-0.5/elf.c~	2012-04-12 20:24:39.903775797 +0200
++++ ltrace-0.5/elf.c	2012-04-12 20:26:06.436424421 +0200
+@@ -114,7 +114,7 @@ static GElf_Addr get_glink_vma(struct lt
+ 	    && !get_section_covering(lte, ppcgot, &ppcgot_sec, &ppcgot_shdr))
+ 		// xxx should be the log out
+ 		fprintf(stderr,
+-			"DT_PPC_GOT=%#llx, but no such section found.\n",
++			"DT_PPC_GOT=%#"PRIx64", but no such section found.\n",
+ 			ppcgot);
+ 
+ 	if (ppcgot_sec != NULL) {
+
+Diff finished.  Thu Apr 12 20:26:16 2012

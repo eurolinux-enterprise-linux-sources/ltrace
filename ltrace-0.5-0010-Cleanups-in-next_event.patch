@@ -1,0 +1,38 @@
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2011-07-28 17:22:56.324468062 +0200
++++ ltrace-0.5-pm/wait_for_something.c	2011-07-28 17:43:35.900263693 +0200
+@@ -9,6 +9,7 @@
+ #include <errno.h>
+ #include <signal.h>
+ #include <string.h>
++#include <stdint.h>
+ 
+ #include "ltrace.h"
+ #include "options.h"
+@@ -118,10 +118,11 @@ struct event *wait_for_something(void)
+ 		continue_process(event.proc->pid);
+ 		return &event;
+ 	}
+-	if (opt_i) {
+-		event.proc->instruction_pointer =
+-		    get_instruction_pointer(event.proc);
+-	}
++	event.proc->instruction_pointer = get_instruction_pointer(event.proc);
++	if (event.proc->instruction_pointer == (void *)(uintptr_t)-1) {
++		if (errno != 0)
++			perror("get_instruction_pointer");
++ 	}
+ 	switch (syscall_p(event.proc, status, &tmp)) {
+ 	case 1:
+ 		event.thing = LT_EV_SYSCALL;
+@@ -170,10 +171,6 @@ struct event *wait_for_something(void)
+ 	}
+ 
+ 	event.thing = LT_EV_BREAKPOINT;
+-	if (!event.proc->instruction_pointer) {
+-		event.proc->instruction_pointer =
+-		    get_instruction_pointer(event.proc);
+-	}
+ 	event.e_un.brk_addr =
+ 	    event.proc->instruction_pointer - DECR_PC_AFTER_BREAK;
+ 	return &event;

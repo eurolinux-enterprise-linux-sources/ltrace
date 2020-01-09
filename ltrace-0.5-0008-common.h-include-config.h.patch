@@ -1,0 +1,13 @@
+diff -up ltrace-0.5-pm/ltrace.h\~ ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5-pm/ltrace.h~	2011-07-28 17:02:54.037324087 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 17:03:51.799249797 +0200
+@@ -4,6 +4,7 @@
+ #include <sys/types.h>
+ #include <sys/time.h>
+ #include <stdio.h>
++#include "config.h"
+ 
+ #include "defs.h"
+ #include "dict.h"
+
+Diff finished.  Thu Jul 28 17:04:05 2011

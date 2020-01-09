@@ -1,0 +1,490 @@
+diff -urp ltrace-0.5/breakpoints.c ltrace-0.5.pm/breakpoints.c
+--- ltrace-0.5/breakpoints.c	2012-03-06 00:42:34.840515311 +0100
++++ ltrace-0.5.pm/breakpoints.c	2012-03-06 00:33:15.733550436 +0100
+@@ -217,7 +217,6 @@ breakpoints_init(struct process *proc, i
+ 
+ 	entry_bp->cbs = &entry_callbacks;
+ 	proc->callstack_depth = 0;
+-	proc->old = 0;
+ 	return 0;
+ }
+ 
+diff -urp ltrace-0.5/elf.c ltrace-0.5.pm/elf.c
+--- ltrace-0.5/elf.c	2012-03-06 00:42:34.850515613 +0100
++++ ltrace-0.5.pm/elf.c	2012-03-05 23:45:33.636923303 +0100
+@@ -193,6 +193,7 @@ do_init_elf(struct ltelf *lte, const cha
+ 	size_t relplt_size = 0;
+ 	Elf_Data *plt_data = NULL;
+ 	GElf_Addr ppcgot = 0;
++	GElf_Addr soname = 0;
+ 
+ 	debug(1, "Reading ELF from %s...", filename);
+ 
+@@ -291,6 +292,8 @@ do_init_elf(struct ltelf *lte, const cha
+ 					relplt_addr = dyn.d_un.d_ptr;
+ 				else if (dyn.d_tag == DT_PLTRELSZ)
+ 					relplt_size = dyn.d_un.d_val;
++				else if (dyn.d_tag == DT_SONAME)
++					soname = dyn.d_un.d_val;
+ 				else if (dyn.d_tag == DT_PPC_GOT) {
+ 					ppcgot = dyn.d_un.d_val;
+ 					debug(1, "ppcgot %#llx", ppcgot);
+@@ -390,6 +393,8 @@ do_init_elf(struct ltelf *lte, const cha
+ 		error(EXIT_FAILURE, 0,
+ 		      "Couldn't find .dynsym or .dynstr in \"%s\"", filename);
+ 
++	lte->soname = soname > 0 ? lte->dynstr + soname : NULL;
++
+ 	if (!relplt_addr || !lte->plt_addr) {
+ 		debug(1, "%s has no PLT relocations", filename);
+ 		lte->relplt = NULL;
+@@ -531,11 +536,10 @@ symbol_matches(struct ltelf *lte, size_t
+ 
+ 	if (gelf_getsym(lte[lte_i].dynsym, symidx, tmp) == NULL)
+ 		error(EXIT_FAILURE, 0, "Couldn't get symbol from .dynsym");
+-	else {
+-		tmp->st_value += lte[lte_i].base_addr;
++	else
+ 		debug(2, "symbol found: %s, %zd, %lx",
+ 		      name, lte_i, tmp->st_value);
+-	}
++
+ 	return tmp->st_value != 0
+ 		&& tmp->st_shndx != SHN_UNDEF
+ 		&& strcmp(name, lte[lte_i].dynstr + tmp->st_name) == 0;
+diff -urp ltrace-0.5/elf.h ltrace-0.5.pm/elf.h
+--- ltrace-0.5/elf.h	2012-03-06 00:42:34.850515613 +0100
++++ ltrace-0.5.pm/elf.h	2012-03-05 23:43:20.922944047 +0100
+@@ -13,6 +13,7 @@ struct ltelf {
+ 	Elf_Data *dynsym;
+ 	size_t dynsym_count;
+ 	const char *dynstr;
++	const char *soname;
+ 	GElf_Addr plt_addr;
+ 	size_t plt_size;
+ 	Elf_Data *relplt;
+@@ -28,8 +29,8 @@ struct ltelf {
+ 	int lte_flags;
+ 	GElf_Addr dyn_addr;
+ 	size_t dyn_sz;
+-	GElf_Addr base_addr;
+ 	GElf_Addr plt_stub_vma;
++	GElf_Addr bias;
+ };
+ 
+ #define ELF_MAX_SEGMENTS  50
+diff -urp ltrace-0.5/ltrace.1 ltrace-0.5.pm/ltrace.1
+--- ltrace-0.5/ltrace.1	2012-03-06 00:42:34.450503555 +0100
++++ ltrace-0.5.pm/ltrace.1	2012-03-05 23:42:18.510961971 +0100
+@@ -39,6 +39,11 @@ Use more (ie.
+ .I \-dd
+ ) for greater debugging information.
+ .TP
++.I \-\-dl
++When a dlopened library is mapped in the process address space, put
++breakpoints to all symbols in the dynamic symbol table of that
++library.
++.TP
+ .I \-e expr
+ A qualifying expression which modifies which events to trace.
+ The format of the expression is:
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5.pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2012-03-06 00:42:34.840515311 +0100
++++ ltrace-0.5.pm/ltrace.h	2012-03-06 00:33:56.264771056 +0100
+@@ -155,7 +155,9 @@ struct process {
+ 	int early;	/* for consistency checks, this is true for
+ 			 * children whose TRAP was delivered before
+ 			 * the fork message of the parent.  */
+-	int old;
++
++	int seen_initial;	/* whether we've seen the trap for
++				 * first instruction after exec.  */
+ 
+ 	int callstack_depth;
+ 	struct callstack_element callstack[MAX_CALLDEPTH];
+diff -urp ltrace-0.5/options.c ltrace-0.5.pm/options.c
+--- ltrace-0.5/options.c	2012-03-06 00:42:34.820514708 +0100
++++ ltrace-0.5.pm/options.c	2012-03-05 23:37:07.121628216 +0100
+@@ -21,7 +21,6 @@
+ #include "options.h"
+ #include "defs.h"
+ 
+-#define MAX_LIBRARY		30
+ char *library[MAX_LIBRARY];
+ int library_num = 0;
+ static char *progname;		/* Program name (`ltrace') */
+@@ -42,6 +41,9 @@ int opt_C = 0;			/* Demangle low-level s
+ #endif
+ int opt_n = 0;			/* indent trace output according to program flow */
+ int opt_T = 0;			/* show the time spent inside each call */
++int opt_dl = 0;			/* place breakpoints to symbols in
++				   dlopened libraries  */
++#define OPT_DL 257
+ 
+ /* List of pids given to option -p: */
+ struct opt_p_t *opt_p = NULL;	/* attach to process with a given pid */
+@@ -83,6 +85,7 @@ static void usage(void)
+ # endif
+ # if HAVE_GETOPT_LONG
+ 		"  -d, --debug         print debugging info.\n"
++		"      --dl            show calls to symbols in dlopened libraries.\n"
+ # else
+ 		"  -d                  print debugging info.\n"
+ # endif
+@@ -176,6 +179,7 @@ char **process_options(int argc, char **
+ 		static struct option long_options[] = {
+ 			{"align", 1, 0, 'a'},
+ 			{"debug", 0, 0, 'd'},
++			{"dl", 0, NULL, OPT_DL},
+ # ifdef USE_DEMANGLE
+ 			{"demangle", 0, 0, 'C'},
+ #endif
+@@ -316,6 +320,9 @@ char **process_options(int argc, char **
+ 		case 'u':
+ 			opt_u = optarg;
+ 			break;
++		case OPT_DL:
++			opt_dl = 1;
++			break;
+ 		case 'V':
+ 			printf("ltrace version " PACKAGE_VERSION ".\n"
+ 			       "Copyright (C) 1997-2006 Juan Cespedes <cespedes@debian.org>.\n"
+diff -urp ltrace-0.5/options.h ltrace-0.5.pm/options.h
+--- ltrace-0.5/options.h	2012-03-06 00:42:34.820514708 +0100
++++ ltrace-0.5.pm/options.h	2012-03-05 20:55:37.648920545 +0100
+@@ -20,6 +20,8 @@ extern int opt_t;		/* print absolute tim
+ extern int opt_C;		/* Demanglelow-level symbol names into user-level names */
+ extern int opt_n;		/* indent trace output according to program flow */
+ extern int opt_T;		/* show the time spent inside each call */
++extern int opt_dl;		/* place breakpoints to symbols in
++				   dlopened libraries  */
+ 
+ struct opt_p_t {
+ 	pid_t pid;
+diff -urp ltrace-0.5/process_event.c ltrace-0.5.pm/process_event.c
+--- ltrace-0.5/process_event.c	2012-03-06 00:42:34.840515311 +0100
++++ ltrace-0.5.pm/process_event.c	2012-03-06 00:42:04.079588108 +0100
+@@ -527,8 +527,11 @@ static void process_breakpoint(struct ev
+ 	}
+ 
+ 	if (event->proc->state != STATE_IGNORED) {
+-		output_line(event->proc, "unexpected breakpoint at %p",
+-			    (void *)event->e_un.brk_addr);
++		if (!event->proc->seen_initial)
++			event->proc->seen_initial = 1;
++		else
++			output_line(event->proc, "unexpected breakpoint at %p",
++				    (void *)event->e_un.brk_addr);
+ 	}
+ 	continue_process(event->proc->pid);
+ }
+diff -urp ltrace-0.5/sysdeps/linux-gnu/proc.c ltrace-0.5.pm/sysdeps/linux-gnu/proc.c
+--- ltrace-0.5/sysdeps/linux-gnu/proc.c	2012-03-06 00:42:34.870516216 +0100
++++ ltrace-0.5.pm/sysdeps/linux-gnu/proc.c	2012-03-06 00:38:48.063679754 +0100
+@@ -332,8 +332,12 @@ find_dynamic_entry_addr(struct process *
+ struct cb_data {
+ 	const char *lib_name;
+ 	struct ltelf *lte;
+-	ElfW(Addr) addr;
++	GElf_Addr bias;
+ 	struct process *proc;
++	int is_base;
++};
++enum {
++	LT_RD_BASE = 0x1000,
+ };
+ 
+ /* Our own type for representing 32-bit linkmap.  We can't rely on the
+@@ -348,9 +352,12 @@ struct cb_data {
+ 		Elf##BITS##_Addr l_next;	\
+ 		Elf##BITS##_Addr l_prev;	\
+ 	}
++
+ struct lt_link_map_32 LT_LINK_MAP(32);
+ struct lt_link_map_64 LT_LINK_MAP(64);
+ 
++#undef LT_LINK_MAP
++
+ static int
+ fetch_lm64(struct process *proc, Elf64_Addr addr, struct lt_link_map_64 *ret)
+ {
+@@ -395,6 +402,8 @@ lm_fetcher(struct process *proc))(struct
+ struct lt_r_debug_32 LT_R_DEBUG(32);
+ struct lt_r_debug_64 LT_R_DEBUG(64);
+ 
++#undef LT_R_DEBUG
++
+ static int
+ fetch_rd64(struct process *proc, Elf64_Addr addr, struct lt_r_debug_64 *ret)
+ {
+@@ -462,8 +471,14 @@ crawl_linkmap(struct process *proc, stru
+ 		}
+ 
+ 		if (callback) {
+-			debug(2, "Dispatching callback for: %s, Loaded at 0x%x\n", lib_name, rlm.l_addr);
+-			data->addr = rlm.l_addr;
++			debug(2, "Dispatching callback for: %s, bias 0x%x\n",
++			      lib_name, rlm.l_addr);
++
++			/* Note that l_addr is a _bias_, not absolute
++			 * load address.  It also happens to actually
++			 * be base address (as the comment in link.h
++			 * implies) unless the file is prelinked.  */
++			data->bias = rlm.l_addr;
+ 			data->lib_name = lib_name;
+ 			callback(data);
+ 		}
+@@ -484,16 +499,29 @@ load_debug_struct(struct process *proc,
+ 	return 0;
+ }
+ 
++static GElf_Addr
++bias(struct process *proc, GElf_Addr base, GElf_Addr bias)
++{
++	/* We need to respect the bitness of operands so that result
++	 * wraps around the right way.  */
++	if (sizeof(long) == 4 || proc->mask_32bit)
++		return (Elf32_Addr)base + (Elf32_Addr)bias;
++	else
++		return base + bias;
++}
++
+ static int
+-deref_opd(struct process *proc, GElf_Addr raddr, GElf_Addr *retp)
++deref_opd(struct process *proc, GElf_Addr raddr,
++	  GElf_Addr *retp, GElf_Addr a_bias)
+ {
+ #ifdef __powerpc64__
+ 	if (!proc->mask_32bit) {
+ 		if (umovebytes(proc, (void *)raddr, retp, sizeof(*retp))
+ 		    != sizeof(*retp))
+ 			return -1;
+-		else
+-			return 0;
++
++		*retp = bias(proc, *retp, a_bias);
++		return 0;
+ 	}
+ #endif
+ 
+@@ -501,12 +529,81 @@ deref_opd(struct process *proc, GElf_Add
+ 	return 0;
+ }
+ 
++static int
++add_library_breakpoint(struct cb_data *lm_add, const char *name, GElf_Sym *sym)
++{
++	debug(2, "found symbol %s @ %lx, adding it.", name, sym->st_value);
++
++	GElf_Addr addr = bias(lm_add->proc, sym->st_value, lm_add->bias);
++	if (deref_opd(lm_add->proc, addr, &addr, lm_add->bias) < 0) {
++		fprintf(stderr, "Couldn't resolve OPD for %s\n", name);
++		return -1;
++	}
++
++	int indirect = GELF_ST_TYPE(sym->st_info) == STT_GNU_IFUNC;
++	char *xn = (char *)name;
++	if (indirect && asprintf(&xn, "%s.IFUNC", name) < 0)
++		return -1;
++
++	add_library_symbol(addr, xn, &library_symbols,
++			   LS_TOPLT_NONE, 0);
++	if (indirect)
++		free(xn); /* add_library_symbol makes a copy itself.  */
++	library_symbols->is_indirect = indirect;
++
++	insert_breakpoint(lm_add->proc,
++			  sym2addr(lm_add->proc, library_symbols),
++			  library_symbols, 1);
++	return 0;
++}
++
++/* Put a breakpoint to all symbols of this library.  */
++static void
++populate_dl(struct cb_data *lm_add, struct ltelf *lte)
++{
++	size_t i;
++	for (i = 0; i < lte->dynsym_count; ++i) {
++		GElf_Sym sym;
++		if (gelf_getsym(lte->dynsym, i, &sym) == NULL)
++			continue;
++		int bind = GELF_ST_BIND(sym.st_info);
++		int type = GELF_ST_TYPE(sym.st_info);
++		if ((bind != STB_GLOBAL && type != STB_LOCAL)
++		    || (type != STT_FUNC && type != STT_GNU_IFUNC)
++		    || sym.st_shndx == SHN_UNDEF)
++			continue;
++
++		const char *name = lte->dynstr + sym.st_name;
++		const char *libname
++			= lte->soname != NULL ? lte->soname : lm_add->lib_name;
++		char *rename;
++		if (asprintf(&rename, "%s@%s", name, libname) < 0)
++			rename = (char *)name;
++		add_library_breakpoint(lm_add, rename, &sym);
++		if (rename != name)
++			/* add_library_symbol makes a copy itself.  */
++			free(rename);
++	}
++}
++
++/* Populate a library with breakpoints requested with -x.  */
++static void
++populate_x(struct cb_data *lm_add, struct ltelf *lte)
++{
++	GElf_Sym sym;
++	struct opt_x_t *xptr;
++	for (xptr = opt_x; xptr; xptr = xptr->next)
++		if (!xptr->found
++		    && in_load_libraries(xptr->name, lte, 1, &sym)
++		    && add_library_breakpoint(lm_add, xptr->name, &sym) == 0)
++			xptr->found = 1;
++}
++
+ static void
+ linkmap_add_cb(void *data) { //const char *lib_name, ElfW(Addr) addr) {
+ 	int i = 0;
+ 	struct cb_data *lm_add = data;
+ 	struct ltelf lte;
+-	struct opt_x_t *xptr;
+ 
+ 	debug(1, "linkmap_add_cb");
+ 
+@@ -528,43 +625,22 @@ linkmap_add_cb(void *data) { //const cha
+ 	if (library_num < MAX_LIBRARY) {
+ 		library[library_num++] = strdup(lm_add->lib_name);
+ 		memset(&lte, 0, sizeof(struct ltelf));
+-		lte.base_addr = lm_add->addr;
++
+ 		do_init_elf(&lte, library[library_num-1]);
+-		/* add bps */
+-		for (xptr = opt_x; xptr; xptr = xptr->next) {
+-			if (xptr->found)
+-				continue;
+-
+-			GElf_Sym sym;
+-			GElf_Addr addr;
+-
+-			if (in_load_libraries(xptr->name, &lte, 1, &sym)) {
+-				debug(2, "found symbol %s @ %lx, adding it.", xptr->name, sym.st_value);
+-				if (deref_opd(lm_add->proc, sym.st_value,
+-					      &addr) < 0) {
+-					fprintf(stderr, "Couldn't resolve OPD"
+-						" for %s\n", xptr->name);
+-					continue;
+-				}
+-				int indirect = (GELF_ST_TYPE(sym.st_info)
+-						== STT_GNU_IFUNC);
+-				char *xn = xptr->name;
+-				if (indirect) {
+-					if (asprintf(&xn, "%s.IFUNC",
+-						     xptr->name) < 0)
+-						continue;
+-				}
+-
+-				add_library_symbol(addr, xn, &library_symbols,
+-						   LS_TOPLT_NONE, 0);
+-				if (indirect)
+-					free(xn); /* ^^ makes a copy itself */
+-				library_symbols->is_indirect = indirect;
+-
+-				xptr->found = 1;
+-				insert_breakpoint(lm_add->proc, sym2addr(lm_add->proc, library_symbols), library_symbols, 1);
+-			}
+-		}
++
++		/* IS_BASE is true for libraries that the binary
++		 * depends on, opened during the first dynamic linker
++		 * pass.  It is false for libraries opened with
++		 * dlopen.
++		 *
++		 * We populate all libraries with static breakpoints.
++		 * When in --dl mode, for !base libraries we _instead_
++		 * place breakpoints on _all_ static symbols, as if -x
++		 * was requested for each of them.  */
++		if (lm_add->is_base || !opt_dl)
++			populate_x(lm_add, &lte);
++		else
++			populate_dl(lm_add, &lte);
+ 		do_close_elf(&lte);
+ 	}
+ }
+@@ -580,15 +656,23 @@ arch_check_dbg(struct process *proc)
+ 		return;
+ 	}
+ 
++	long prev_state = proc->debug_state;
++	int is_base = 0;
++	if (prev_state & LT_RD_BASE) {
++		prev_state &= ~LT_RD_BASE;
++		is_base = 1;
++	}
++
+ 	if (dbg.r_state == RT_CONSISTENT) {
+ 		debug(2, "Linkmap is now consistent");
+-		if (proc->debug_state == RT_ADD) {
++		if (prev_state == RT_ADD) {
+ 			struct cb_data data = {
+ 				.proc = proc,
++				.is_base = is_base,
+ 			};
+ 			debug(2, "Adding DSO to linkmap");
+ 			crawl_linkmap(proc, &dbg, linkmap_add_cb, &data);
+-		} else if (proc->debug_state == RT_DELETE) {
++		} else if (prev_state == RT_DELETE) {
+ 			debug(2, "Removing DSO from linkmap");
+ 		} else {
+ 			debug(2, "Unexpected debug state!");
+@@ -601,9 +685,6 @@ arch_check_dbg(struct process *proc)
+ static void
+ hook_libdl_cb(void *data) {
+ 	struct cb_data *hook_data = data;
+-	const char *lib_name = NULL;
+-	ElfW(Addr) addr;
+-	struct ltelf *lte = NULL;
+ 
+ 	debug(1, "add_library_cb");
+ 
+@@ -612,13 +693,10 @@ hook_libdl_cb(void *data) {
+ 		return;
+ 	}
+ 
+-	lib_name = hook_data->lib_name;
+-	addr = hook_data->addr;
+-	lte = hook_data->lte;
++	const char *lib_name = hook_data->lib_name;
+ 
+ 	if (library_num < MAX_LIBRARY) {
+ 		library[library_num++] = strdup(lib_name);
+-		lte[library_num].base_addr = addr;
+ 	}
+ 	else {
+ 		fprintf (stderr, "MAX LIBS REACHED\n");
+@@ -643,7 +721,7 @@ linkmap_init(struct process *proc, struc
+ 	}
+ 
+ 	GElf_Addr faddr;
+-	if (deref_opd(proc, rdbg.r_brk, &faddr) < 0) {
++	if (deref_opd(proc, rdbg.r_brk, &faddr, rdbg.r_ldbase) < 0) {
+ 		fprintf(stderr, "Can't load r_brk address from OPD\n");
+ 		return -1;
+ 	}
+@@ -655,6 +733,7 @@ linkmap_init(struct process *proc, struc
+ 		.lte = lte,
+ 	};
+ 	crawl_linkmap(proc, &rdbg, hook_libdl_cb, &data);
++	proc->debug_state = RT_ADD | LT_RD_BASE;
+ 
+ 	return 0;
+ }
+diff -up ./process_event.c~ ./process_event.c
+--- ./process_event.c~	2012-04-03 17:31:01.862942450 +0200
++++ ./process_event.c	2012-04-03 18:01:53.159033743 +0200
+@@ -368,6 +368,7 @@ static void process_exec(struct event *
+ 	proc->mask_32bit = 0;
+ 	proc->personality = 0;
+ 	proc->arch_ptr = NULL;
++	proc->seen_initial = 0;
+ 	free(proc->filename);
+ 	proc->filename = pid2name(proc->pid);
+ 	breakpoints_init(proc, 0);

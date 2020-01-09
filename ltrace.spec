@@ -1,7 +1,7 @@
 Summary: Tracks runtime library calls from dynamically linked executables
 Name: ltrace
 Version: 0.5
-Release: 16.45svn.1%{?dist}
+Release: 23.45svn%{?dist}
 URL: http://ltrace.alioth.debian.org/
 License: GPLv2+
 Group: Development/Debuggers
@@ -36,6 +36,70 @@ Patch18: ltrace-0.5-s390-31-on-64.patch
 Patch19: ltrace-0.5-fork-ppc64.patch
 Patch20: ltrace-0.5-exec-stripped.patch
 Patch21: ltrace-0.5-ppc-plt-glink.patch
+Patch22: ltrace-0.5-demangle.patch
+
+# Patchset for multi-threaded tracing
+#  https://bugzilla.redhat.com/show_bug.cgi?id=526007
+Patch100: ltrace-0.5-clone_support.patch
+Patch101: ltrace-0.5-0002-Fix-wrong-memory-initialization.patch
+Patch102: ltrace-0.5-0003-Plug-a-leak-in-breakpoints_init.patch
+Patch103: ltrace-0.5-0004-Coding-style-nits.patch
+Patch104: ltrace-0.5-0005-char-char-const-one-argument-of-output_left.patch
+Patch105: ltrace-0.5-0006-Drop-field-type_being_displayed.patch
+Patch106: ltrace-0.5-0007-Streamline-interfaces-execute_program-open_program.patch
+Patch107: ltrace-0.5-0008-common.h-include-config.h.patch
+Patch108: ltrace-0.5-0009-Pass-Process-instead-of-pid-to-a-couple-functions.patch
+Patch109: ltrace-0.5-0010-Cleanups-in-next_event.patch
+Patch110: ltrace-0.5-0011-Add-argument-that-defines-whether-we-should-enable-b.patch
+Patch111: ltrace-0.5-0012-Conceal-the-list-of-processes-behind-an-interface.patch
+Patch112: ltrace-0.5-0013-Add-a-concept-of-tasks-and-leader-thread.patch
+Patch113: ltrace-0.5-0014-Event-queue.patch
+Patch114: ltrace-0.5-0015-Facility-for-custom-event-handler.patch
+Patch115: ltrace-0.5-0016-Use-custom-event-handler-for-implementation-of-stop-.patch
+Patch116: ltrace-0.5-0020-Type-the-process_status-interface-properly.patch
+Patch117: ltrace-0.5-0017-Handle-multi-threaded-attach-detach-gracefully.patch
+Patch118: ltrace-0.5-0018-Fixes-for-process-exit-before-doing-checks-for-sysca.patch
+Patch119: ltrace-0.5-0019-Add-a-test-case.patch
+Patch120: ltrace-0.5-0021-Fix-a-race-between-waiting-for-SIGSTOP-delivery-and-.patch
+Patch121: ltrace-0.5-0022-Don-t-share-arch_ptr-on-process-clone.patch
+Patch122: ltrace-0.5-0023-Fix-a-race-between-disabling-breakpoint-and-stopping.patch
+Patch123: ltrace-0.5-ia64-ptrace-redef.patch
+Patch124: ltrace-0.5-0024-Handle-the-race-between-reading-list-of-tasks-and-at.patch
+Patch125: ltrace-0.5-0025-Fix-serious-race-in-attach-to-many-threaded-process.patch
+Patch126: ltrace-0.5-0026-Fix-detach.patch
+Patch127: ltrace-0.5-syscall_p.patch
+Patch128: ltrace-0.5-vfork.patch
+Patch129: ltrace-0.5-signal-before-singlestep.patch
+Patch130: ltrace-0.5-ppc64-leader-running.patch
+Patch131: ltrace-0.5-ia64-robustify.patch
+Patch132: ltrace-0.5-clone-test-compilation.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=806241
+Patch133: ltrace-0.5-pass-leader.patch
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=738254
+Patch140: ltrace-0.5-dlopen.patch
+Patch141: ltrace-0.5-ifunc.patch
+Patch142: ltrace-0.5-startup.patch
+Patch143: ltrace-0.5-dlopen-opd.patch
+Patch144: ltrace-0.5-dlopen-64-32.patch
+Patch145: ltrace-0.5-dlopen-auto.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=806242
+Patch146: ltrace-0.5-dlopen-man.patch
+Patch147: ltrace-0.5-dlopen-double-bias.patch
+Patch148: ltrace-0.5-dlopen-attach.patch
+Patch149: ltrace-0.5-dlopen-opd-bias.patch
+Patch150: ltrace-0.5-sigint.patch
+Patch151: ltrace-0.5-s390x-sigill.patch
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=805198
+Patch160: ltrace-0.5-coverity.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=811088
+Patch161: ltrace-0.5-fix-testcase-attach-process.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=811184
+Patch162: ltrace-0.5-ppc64-linked-calls.patch
+Patch163: ltrace-0.5-ppc64-atomic-skip.patch
+# https://bugzilla.redhat.com/show_bug.cgi?id=811960
+Patch164: ltrace-0.5-warnings.patch
 
 %description
 Ltrace is a debugging program which runs a specified command until the
@@ -49,6 +113,7 @@ execution of processes.
 
 %prep
 %setup -q
+
 %patch0 -p0
 %patch1 -p1
 %patch2 -p1
@@ -71,6 +136,62 @@ execution of processes.
 %patch19 -p1
 %patch20 -p1
 %patch21 -p1
+%patch22 -p1
+
+%patch100 -p1
+%patch101 -p1
+%patch102 -p1
+%patch103 -p1
+%patch104 -p1
+%patch105 -p1
+%patch106 -p1
+%patch107 -p1
+%patch108 -p1
+%patch109 -p1
+%patch110 -p1
+%patch111 -p1
+%patch112 -p1
+%patch113 -p1
+%patch114 -p1
+%patch115 -p1
+%patch116 -p1
+%patch117 -p1
+%patch118 -p1
+%patch119 -p1
+%patch120 -p1
+%patch121 -p1
+%patch122 -p1
+%patch123 -p1
+%patch124 -p1
+%patch125 -p1
+%patch126 -p1
+%patch127 -p1
+%patch128 -p1
+%patch129 -p1
+%patch130 -p1
+%patch131 -p1
+%patch132 -p1
+%patch133 -p1
+
+%patch140 -p1
+%patch141 -p1
+%patch142 -p1
+%patch143 -p1
+%patch144 -p1
+%patch145 -p1
+%patch146 -p1
+%patch147 -p1
+%patch148 -p1
+%patch149 -p1
+%patch150 -p1
+%patch151 -p1
+
+%patch160 -p1
+%patch161 -p1
+%patch162 -p1
+%patch163 -p1
+%patch164 -p1
+
 sed -i -e 's/-o root -g root//' Makefile.in
 
 %build
@@ -86,10 +207,10 @@ make DESTDIR=$RPM_BUILD_ROOT bindir=%{_bindir} docdir=%{_docdir}/ltrace-%{versio
 
 # The testsuite is useful for development in real world, but fails in
 # koji for some reason.  Disable it, but have it handy.
-#%check
-#echo ====================TESTING=========================
-#make check
-#echo ====================TESTING END=====================
+%check
+echo ====================TESTING=========================
+make check || :
+echo ====================TESTING END=====================
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -102,6 +223,51 @@ rm -rf $RPM_BUILD_ROOT
 %config(noreplace) %{_sysconfdir}/ltrace.conf
 
 %changelog
+* Wed Apr 11 2012 Petr Machata <pmachata@redhat.com> - 0.5-23.45svn
+- Fix the case that a breakpoint is reported by SIGILL instead of
+  SIGTRAP, and DECR_PC_AFTER_BREAK is non-zero, as is the case on
+  s390 (ltrace-0.5-s390x-sigill.patch)
+- Fix detach from sleeping process (ltrace-0.5-sigint.patch)
+- Resolves: #738254
+- Fix attach test case, patch courtesy of
+  Edjunior Barbosa Machado <emachado@br.ibm.com>
+  (ltrace-0.5-fix-testcase-attach-process.patch)
+- Resolves: #811088
+- Fix tracing return from functions called using a plain branch
+  instead of library call (ltrace-0.5-ppc64-linked-calls.patch)
+- Add a patch for single-stepping over a lwarx/ldarx instruction
+  (ltrace-0.5-ppc64-atomic-skip.patch)
+- Resolves: #811184
+- Adjust the code to avoid some warnings (ltrace-0.5-warnings.patch)
+
+* Thu Apr  5 2012 Petr Machata <pmachata@redhat.com> - 0.5-22.45svn
+- Bias shoud be applied to address read from .opd only if that address
+  wasn't yet resolved by the dynamic linker
+  (ltrace-0.5-dlopen-opd-bias.patch)
+- Resolves: #738254
+
+* Wed Apr  4 2012 Petr Machata <pmachata@redhat.com> - 0.5-21.45svn
+- Fix dlopen on attach (ltrace-0.5-dlopen-attach.patch)
+- Resolves: #738254
+
+* Tue Apr  3 2012 Petr Machata <pmachata@redhat.com> - 0.5-20.45svn
+- Fix dlopen support when dynamic linker is not prelinked
+  (ltrace-0.5-dlopen-double-bias.patch)
+- Fix unexpected breakpoint messages appearing after exec
+- Resolves: #738254
+
+* Fri Mar 23 2012 Petr Machata <pmachata@redhat.com> - 0.5-19.45svn
+- Add a patch to fix two coverity citations
+- Resolves: #805198
+- Fix a bug in multi-threaded support (ltrace-0.5-pass-leader.patch)
+- Update man page (ltrace-0.5-dlopen-man.patch)
+
+* Wed Feb 22 2012 Petr Machata <pmachata@redhat.com> - 0.5-18.45svn
+- Add patches for tracing multi-threaded processes
+- Resolves: #742340
+- Add a patch for tracing calls made from dlopened libraries
+- Resolves: #738254
+
 * Wed May 19 2010 Petr Machata <pmachata@redhat.com> - 0.5-16.45svn.1
 - Support zero value of undefined symbols in PPC binaries.
 - Resolves: #588338

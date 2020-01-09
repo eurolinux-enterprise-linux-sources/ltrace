@@ -1,0 +1,82 @@
+diff -urp ltrace-0.5/sysdeps/linux-gnu/ia64/regs.c ltrace-0.5-pm/sysdeps/linux-gnu/ia64/regs.c
+--- ltrace-0.5/sysdeps/linux-gnu/ia64/regs.c	2006-02-20 16:48:07.000000000 -0500
++++ ltrace-0.5-pm/sysdeps/linux-gnu/ia64/regs.c	2011-11-16 11:25:18.000000000 -0500
+@@ -4,6 +4,7 @@
+ 
+ #include <sys/types.h>
+ #include <sys/ptrace.h>
++#include <errno.h>
+ 
+ #include <asm/ptrace_offsets.h>
+ #include <asm/rse.h>
+@@ -39,10 +40,16 @@ void set_instruction_pointer(struct proc
+ 
+ void *get_stack_pointer(struct process *proc)
+ {
+-	return (void *)ptrace(PTRACE_PEEKUSER, proc->pid, PT_R12, 0);
++	long l = ptrace(PTRACE_PEEKUSER, proc->pid, PT_R12, 0);
++	if (l == -1 && errno)
++		return NULL;
++	return (void *)l;
+ }
+ 
+ void *get_return_addr(struct process *proc, void *stack_pointer)
+ {
+-	return (void *)ptrace(PTRACE_PEEKUSER, proc->pid, PT_B0, 0);
++	long l = ptrace(PTRACE_PEEKUSER, proc->pid, PT_B0, 0);
++	if (l == -1 && errno)
++		return NULL;
++	return (void *)l;
+ }
+diff -urp ltrace-0.5/sysdeps/linux-gnu/ia64/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/ia64/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/ia64/trace.c	2011-11-16 11:25:23.000000000 -0500
++++ ltrace-0.5-pm/sysdeps/linux-gnu/ia64/trace.c	2011-11-16 11:25:18.000000000 -0500
+@@ -11,6 +11,7 @@
+ #include <string.h>
+ #include <asm/ptrace_offsets.h>
+ #include <asm/rse.h>
++#include <errno.h>
+ 
+ #include "ltrace.h"
+ 
+@@ -39,9 +40,10 @@ int syscall_p(struct process *proc, int 
+ 
+ 	if (WIFSTOPPED(status)
+ 	    && WSTOPSIG(status) == (SIGTRAP | proc->tracesysgood)) {
+-		unsigned long slot =
+-		    (ptrace(PTRACE_PEEKUSER, proc->pid, PT_CR_IPSR, 0) >> 41) &
+-		    0x3;
++		long l = ptrace(PTRACE_PEEKUSER, proc->pid, PT_CR_IPSR, 0);
++		if (l == -1 && errno)
++			return -1;
++		unsigned long slot = ((unsigned long)l >> 41) & 0x3;
+ 		unsigned long ip =
+ 		    ptrace(PTRACE_PEEKUSER, proc->pid, PT_CR_IIP, 0);
+ 
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2011-11-16 11:25:23.000000000 -0500
++++ ltrace-0.5-pm/wait_for_something.c	2011-11-16 11:25:18.000000000 -0500
+@@ -11,6 +11,7 @@
+ #include <string.h>
+ #include <stdint.h>
+ #include <assert.h>
++#include <unistd.h>
+ 
+ #include "ltrace.h"
+ #include "options.h"
+@@ -195,6 +198,15 @@ struct event *wait_for_something(void)
+ 	debug(3, "signal from pid %u, status %#x", pid, status);
+ 	event.proc = pid2proc(pid);
+ 	if (!event.proc || event.proc->state == STATE_BEING_CREATED) {
++		/* On ia64, we are seeing a waitpid event even though
++		 * the process is still reported to be running.  Wait
++		 * for the tracing stop to propagate.  But don't get
++		 * stuck here forever.  */
++		int i = 0;
++		for (; i < 100 && process_status(pid) != ps_tracing_stop; ++i) {
++			debug(2, "waiting for %d to stop", pid);
++			usleep(10000);
++		}
+ 		event.thing = LT_EV_NEW;
+ 		event.e_un.newpid = pid;
+ 		return &event;

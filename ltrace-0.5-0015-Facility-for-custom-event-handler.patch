@@ -1,0 +1,128 @@
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-07-28 22:53:33.002612928 +0200
++++ ltrace-0.5-pm/ltrace.h	2011-07-28 22:59:22.503604556 +0200
+@@ -106,6 +106,17 @@ enum Process_State {
+ 	STATE_IGNORED  /* ignore this process (it's a fork and no -f was used) */
+ };
+ 
++typedef struct Event_Handler Event_Handler;
++struct Event_Handler {
++	/* Event handler that overrides the default one.  Should
++	 * return NULL if the event was handled, otherwise the
++	 * returned event is passed to the default handler.  */
++	struct event * (* on_event)(Event_Handler * self, struct event * event);
++
++	/* Called when the event handler removal is requested.  */
++	void (* destroy)(Event_Handler * self);
++};
++
+ /* XXX We would rather have this all organized a little differently,
+  * have Process for the whole group and Task for what's there for
+  * per-thread stuff.  But for now this is the less invasive way of
+@@ -143,6 +154,10 @@ struct process {
+ 	short e_machine;
+ 	short need_to_reinitialize_breakpoints;
+ 
++	/* Set in leader.  */
++	Event_Handler * event_handler;
++
++
+ 	/**
+ 	 * Process chaining.
+ 	 **/
+@@ -209,6 +224,9 @@ extern struct event * each_qd_event(enum
+ extern void enque_event(struct event * event);
+ extern struct event *wait_for_something(void);
+ 
++extern void install_event_handler(struct process * proc, Event_Handler * handler);
++extern void destroy_event_handler(struct process * proc);
++
+ extern void process_event(struct event *event);
+ extern pid_t execute_program(const char * command, char ** argv);
+ extern int display_arg(enum tof type, struct process *proc, int arg_num,
+Только в ltrace-0.5-pm: ltrace.h~
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2011-07-28 22:53:33.002612928 +0200
++++ ltrace-0.5-pm/proc.c	2011-07-28 23:01:13.833422637 +0200
+@@ -205,3 +205,20 @@ remove_process(struct process *proc)
+ 		tmp = tmp->next;
+ 	}
+ }
++
++void
++install_event_handler(struct process * proc, Event_Handler * handler)
++{
++	assert(proc->event_handler == NULL);
++	proc->event_handler = handler;
++}
++
++void
++destroy_event_handler(struct process * proc)
++{
++	Event_Handler * handler = proc->event_handler;
++	assert(handler != NULL);
++	handler->destroy(handler);
++	free(handler);
++	proc->event_handler = NULL;
++}
+Только в ltrace-0.5-pm: proc.c~
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2011-07-28 22:53:32.992612588 +0200
++++ ltrace-0.5-pm/process_event.c	2011-07-28 23:00:54.753767957 +0200
+@@ -118,6 +118,8 @@ static void process_clone(struct event *
+ 			enable_breakpoint(p, p->breakpoint_being_enabled);
+ 			p->breakpoint_being_enabled = NULL;
+ 		}
++		if (p->event_handler != NULL)
++			destroy_event_handler(p);
+ 		if (event->proc->state == STATE_ATTACHED && opt_f) {
+ 			p->state = STATE_ATTACHED;
+ 		} else {
+@@ -142,6 +144,8 @@ static void process_new(struct event * e
+ 			enable_breakpoint(proc, proc->breakpoint_being_enabled);
+ 			proc->breakpoint_being_enabled = NULL;
+ 		}
++		if (proc->event_handler != NULL)
++			destroy_event_handler(proc);
+ 		if (opt_f) {
+ 			proc->state = STATE_ATTACHED;
+ 		} else {
+@@ -201,6 +205,19 @@ static char *sysname(struct process *pro
+ 
+ void process_event(struct event *event)
+ {
++	/* If the thread group defines an overriding event handler,
++	   give it a chance to kick in.  */
++	if (event->proc != NULL
++	    && event->proc->leader != NULL) {
++		Event_Handler * handler = event->proc->leader->event_handler;
++		if (handler != NULL) {
++			event = (*handler->on_event) (handler, event);
++			if (event == NULL)
++				/* It was handled.  */
++				return;
++		}
++	}
++
+ 	switch (event->thing) {
+ 	case LT_EV_NONE:
+ 		debug(1, "event: none");
+Только в ltrace-0.5-pm: process_event.c~
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2011-07-28 22:53:33.004612996 +0200
++++ ltrace-0.5-pm/wait_for_something.c	2011-07-28 23:01:49.346640045 +0200
+@@ -146,7 +146,12 @@ each_qd_event(enum ecb_status (*pred)(st
+ static enum ecb_status
+ event_process_not_reenabling(struct event * event, void * data)
+ {
+-	return ecb_deque;
++	if (event->proc == NULL
++	    || event->proc->leader == NULL
++	    || event->proc->leader->event_handler == NULL)
++		return ecb_deque;
++	else
++		return ecb_cont;
+ }
+ 
+ static struct event *
+Только в ltrace-0.5-pm: wait_for_something.c~

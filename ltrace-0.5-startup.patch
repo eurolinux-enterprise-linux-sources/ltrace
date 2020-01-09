@@ -1,0 +1,480 @@
+diff -urp ltrace-0.5/breakpoints.c ltrace-0.5-pm/breakpoints.c
+--- ltrace-0.5/breakpoints.c	2012-02-29 01:54:32.444466942 +0100
++++ ltrace-0.5-pm/breakpoints.c	2012-02-29 01:45:20.607418398 +0100
+@@ -16,6 +16,22 @@
+ #include "dict.h"
+ #include "elf.h"
+ 
++void
++breakpoint_on_hit(struct breakpoint *bp, struct process *proc)
++{
++	assert(bp != NULL);
++	if (bp->cbs != NULL && bp->cbs->on_hit != NULL)
++		(bp->cbs->on_hit) (bp, proc);
++}
++
++void
++breakpoint_on_destroy(struct breakpoint *bp)
++{
++	assert(bp != NULL);
++	if (bp->cbs != NULL && bp->cbs->on_destroy != NULL)
++		(bp->cbs->on_destroy) (bp);
++}
++
+ /*****************************************************************************/
+ 
+ struct breakpoint *address2bpstruct(struct process *proc, void *addr)
+@@ -30,7 +46,7 @@ struct breakpoint *address2bpstruct(stru
+ 	return dict_find_entry(proc->breakpoints, addr);
+ }
+ 
+-void
++struct breakpoint *
+ insert_breakpoint(struct process *proc, void *addr,
+ 		  struct library_symbol *libsym, int enable)
+ {
+@@ -50,7 +66,7 @@ insert_breakpoint(struct process *proc,
+ 	}
+ 
+ 	if (!addr)
+-		return;
++		return NULL;
+ 
+ 	if (libsym)
+ 		libsym->needs_init = 0;
+@@ -59,7 +75,7 @@ insert_breakpoint(struct process *proc,
+ 	if (!sbp) {
+ 		sbp = calloc(1, sizeof(struct breakpoint));
+ 		if (!sbp) {
+-			return;	/* TODO FIXME XXX: error_mem */
++			return NULL;	/* TODO FIXME XXX: error_mem */
+ 		}
+ 		dict_enter(leader->breakpoints, addr, sbp);
+ 		sbp->addr = addr;
+@@ -71,6 +87,8 @@ insert_breakpoint(struct process *proc,
+ 	if (sbp->enabled == 1 && enable) {
+ 		enable_breakpoint(proc, sbp);
+ 	}
++
++	return sbp;
+ }
+ 
+ void delete_breakpoint(struct process *proc, void *addr)
+@@ -99,34 +117,11 @@ static void enable_bp_cb(void *addr, voi
+ 
+ void enable_all_breakpoints(struct process *proc)
+ {
+-	if (proc->breakpoints_enabled <= 0) {
+-#ifdef __powerpc__
+-		unsigned long a;
+-
+-		/*
+-		 * PPC HACK! (XXX FIXME TODO)
+-		 * If the dynamic linker hasn't populated the PLT then
+-		 * dont enable the breakpoints
+-		 */
+-		if (opt_L) {
+-			a = ptrace(PTRACE_PEEKTEXT, proc->pid,
+-				   sym2addr(proc, proc->list_of_symbols),
+-				   0);
+-			if (a == 0x0) {
+-				debug(2, "Not enabling breakpoints for pid %u "
+-				      "yet, PLT is not populated.", proc->pid);
+-				return;
+-			}
+-		}
+-#endif
+-
+-		debug(1, "Enabling breakpoints for pid %u...", proc->pid);
+-		if (proc->breakpoints) {
+-			dict_apply_to_all(proc->breakpoints, enable_bp_cb,
+-					  proc);
+-		}
++	debug(1, "Enabling breakpoints for pid %u...", proc->pid);
++	if (proc->breakpoints) {
++		dict_apply_to_all(proc->breakpoints, enable_bp_cb,
++				  proc);
+ 	}
+-	proc->breakpoints_enabled = 1;
+ }
+ 
+ static void disable_bp_cb(void *addr, void *sbp, void *proc)
+@@ -139,11 +134,8 @@ static void disable_bp_cb(void *addr, vo
+ void disable_all_breakpoints(struct process *proc)
+ {
+ 	assert(proc->leader == proc);
+-	if (proc->breakpoints_enabled) {
+-		debug(1, "Disabling breakpoints for pid %u...", proc->pid);
+-		dict_apply_to_all(proc->breakpoints, disable_bp_cb, proc);
+-	}
+-	proc->breakpoints_enabled = 0;
++	debug(1, "Disabling breakpoints for pid %u...", proc->pid);
++	dict_apply_to_all(proc->breakpoints, disable_bp_cb, proc);
+ }
+ 
+ static void free_bp_cb(void *addr, void *sbp, void *data)
+@@ -152,11 +144,18 @@ static void free_bp_cb(void *addr, void
+ 	free(sbp);
+ }
+ 
++static void
++entry_callback_hit(struct breakpoint *bp, struct process *proc)
++{
++	if (proc == NULL || proc->leader == NULL)
++		return;
++	delete_breakpoint(proc, bp->addr); // xxx
++	reinitialize_breakpoints(proc->leader);
++}
++
+ int
+ breakpoints_init(struct process *proc, int enable)
+ {
+-	struct library_symbol *sym;
+-
+ 	if (proc->breakpoints) {	/* let's remove that struct */
+ 		/* TODO FIXME XXX: free() all "struct breakpoint"s */
+ 		dict_apply_to_all(proc->breakpoints, free_bp_cb, NULL);
+@@ -175,9 +174,11 @@ breakpoints_init(struct process *proc, i
+ 	destroy_library_symbol_chain(proc->list_of_symbols);
+ 	proc->list_of_symbols = NULL;
+ 
++	GElf_Addr entry;
+ 	if (opt_L && proc->filename) {
+-		proc->list_of_symbols = read_elf(proc);
++		proc->list_of_symbols = read_elf(proc, &entry);
+ 		if (proc->list_of_symbols == NULL) {
++		fail:
+ 			/* XXX leak breakpoints */
+ 			return -1;
+ 		}
+@@ -203,10 +204,19 @@ breakpoints_init(struct process *proc, i
+ 			}
+ 		}
+ 	}
+-	for (sym = proc->list_of_symbols; sym; sym = sym->next)
+-		insert_breakpoint(proc, sym2addr(proc, sym), sym, enable);
++	struct breakpoint *entry_bp
++		= insert_breakpoint(proc, (void *)(uintptr_t)entry, NULL, 1);
++	if (entry_bp == NULL) {
++		fprintf(stderr, "fail!\n");
++		goto fail;
++	}
++
++	static struct bp_callbacks entry_callbacks = {
++		.on_hit = entry_callback_hit,
++	};
++
++	entry_bp->cbs = &entry_callbacks;
+ 	proc->callstack_depth = 0;
+-	proc->breakpoints_enabled = -1;
+ 	proc->old = 0;
+ 	return 0;
+ }
+diff -urp ltrace-0.5/elf.c ltrace-0.5-pm/elf.c
+--- ltrace-0.5/elf.c	2012-02-29 01:54:32.494468452 +0100
++++ ltrace-0.5-pm/elf.c	2012-02-29 01:43:40.024384307 +0100
+@@ -632,7 +632,7 @@ static GElf_Addr opd2addr(struct ltelf *
+ 	return ret_val;
+ }
+ 
+-struct library_symbol *read_elf(struct process *proc)
++struct library_symbol *read_elf(struct process *proc, GElf_Addr *entryp)
+ {
+ 	struct ltelf lte[MAX_LIBRARY + 1];
+ 	size_t i;
+@@ -686,11 +686,6 @@ struct library_symbol *read_elf(struct p
+ 			      "Couldn't get relocation from \"%s\"",
+ 			      proc->filename);
+ 
+-#ifdef PLT_REINITALISATION_BP
+-		if (!sym.st_value && PLTs_initialized_by_here)
+-			proc->need_to_reinitialize_breakpoints = 1;
+-#endif
+-
+ 		name = lte->dynstr + sym.st_name;
+ 		count = library_num ? library_num+1 : 0;
+ 
+@@ -715,30 +710,6 @@ struct library_symbol *read_elf(struct p
+ 		}
+ 	}
+ 
+-#ifdef PLT_REINITALISATION_BP
+-	if (proc->need_to_reinitialize_breakpoints) {
+-		struct opt_x_t *main_cheat;
+-		/* Add "PLTs_initialized_by_here" to opt_x list, if not
+-                   already there. */
+-		main_cheat = (struct opt_x_t *)malloc(sizeof(struct opt_x_t));
+-		if (main_cheat == NULL)
+-			error(EXIT_FAILURE, 0, "Couldn't allocate memory");
+-		main_cheat->next = opt_x_loc;
+-		main_cheat->found = 0;
+-		main_cheat->name = PLTs_initialized_by_here;
+-
+-		for (xptr = opt_x_loc; xptr; xptr = xptr->next)
+-			if (strcmp(xptr->name, PLTs_initialized_by_here) == 0
+-			    && main_cheat) {
+-				free(main_cheat);
+-				main_cheat = NULL;
+-				break;
+-			}
+-		if (main_cheat)
+-			opt_x_loc = main_cheat;
+-	}
+-#endif
+-
+ 	for (i = 0; i < lte->symtab_count; ++i) {
+ 		GElf_Sym sym;
+ 		GElf_Addr addr;
+@@ -788,17 +759,15 @@ struct library_symbol *read_elf(struct p
+ 		}
+ 	}
+ 
++	if (lte->ehdr.e_entry != 0)
++		*entryp = opd2addr(lte, (void *)lte->ehdr.e_entry);
++
+ 	for (xptr = opt_x_loc; xptr; xptr = xptr->next)
+ 		if ( ! xptr->found) {
+ 			char *badthing = "WARNING";
+ #ifdef PLT_REINITALISATION_BP
+ 			if (strcmp(xptr->name, PLTs_initialized_by_here) == 0) {
+ 				if (lte->ehdr.e_entry) {
+-					add_library_symbol (
+-						opd2addr (lte, (void*)(long)
+-							lte->ehdr.e_entry),
+-						PLTs_initialized_by_here,
+-						lib_tail, 1, 0);
+ 					fprintf (stderr, "WARNING: Using e_ent"
+ 						 "ry from elf header (%p) for "
+ 						 "address of \"%s\"\n", (void*)
+diff -urp ltrace-0.5/elf.h ltrace-0.5-pm/elf.h
+--- ltrace-0.5/elf.h	2012-02-29 01:54:32.494468452 +0100
++++ ltrace-0.5-pm/elf.h	2012-02-29 01:21:29.564018542 +0100
+@@ -42,7 +42,7 @@ extern int library_num;
+ extern char *library[MAX_LIBRARY];
+ 
+ extern void open_elf(struct ltelf *lte, const char *filename);
+-extern struct library_symbol *read_elf(struct process *);
++extern struct library_symbol *read_elf(struct process *, GElf_Addr *entryp);
+ 
+ extern GElf_Addr arch_plt_sym_val(struct ltelf *, size_t, GElf_Rela *);
+ 
+diff -urp ltrace-0.5/execute_program.c ltrace-0.5-pm/execute_program.c
+--- ltrace-0.5/execute_program.c	2012-02-29 01:54:32.264461499 +0100
++++ ltrace-0.5-pm/execute_program.c	2012-02-29 01:46:47.310403548 +0100
+@@ -90,6 +90,8 @@ execute_program(const char * command, ch
+ 		exit(1);
+ 	}
+ 
++	wait_for_proc(pid);
++
+ 	debug(1, "PID=%d", pid);
+ 
+ 	return pid;
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-pm/ltrace.h
+--- ltrace-0.5/ltrace.h	2012-02-29 01:54:32.504468755 +0100
++++ ltrace-0.5-pm/ltrace.h	2012-02-29 01:46:24.119334240 +0100
+@@ -23,13 +23,28 @@ extern char *command;
+ 
+ extern int exiting;		/* =1 if we have to exit ASAP */
+ 
++struct breakpoint;
++struct process;
++
++struct bp_callbacks {
++	void (*on_hit) (struct breakpoint *bp, struct process *proc);
++	void (*on_destroy) (struct breakpoint *bp);
++};
++
+ struct breakpoint {
++	struct bp_callbacks *cbs;
+ 	void *addr;
+ 	unsigned char orig_value[BREAKPOINT_LENGTH];
+ 	int enabled;
+ 	struct library_symbol *libsym;
+ };
+ 
++/* Call on-hit handler of BP, if any is set.  */
++void breakpoint_on_hit(struct breakpoint *bp, struct process *proc);
++
++/* Call on-destroy handler of BP, if any is set.  */
++void breakpoint_on_destroy(struct breakpoint *bp);
++
+ enum arg_type {
+ 	ARGTYPE_UNKNOWN = -1,
+ 	ARGTYPE_VOID,
+@@ -134,7 +149,6 @@ struct process {
+ 	 * processes.  */
+ 	struct dict *breakpoints;
+ 
+-	int breakpoints_enabled;	/* -1:not enabled yet, 0:disabled, 1:enabled */
+ 	int mask_32bit;		/* 1 if 64-bit ltrace is tracing 32-bit process.  */
+ 	unsigned int personality;
+ 	int tracesysgood;	/* signal indicating a PTRACE_SYSCALL trap */
+@@ -247,8 +261,9 @@ extern int display_arg(enum tof type, st
+ 		       enum arg_type at);
+ extern struct breakpoint *address2bpstruct(struct process *proc, void *addr);
+ extern int breakpoints_init(struct process *proc, int enable);
+-extern void insert_breakpoint(struct process *proc, void *addr,
+-			      struct library_symbol *libsym, int enable);
++extern struct breakpoint *insert_breakpoint(struct process *proc, void *addr,
++					    struct library_symbol *libsym,
++					    int enable);
+ extern void delete_breakpoint(struct process *proc, void *addr);
+ extern void enable_all_breakpoints(struct process *proc);
+ extern void disable_all_breakpoints(struct process *proc);
+@@ -274,6 +289,7 @@ extern char *pid2name(pid_t pid);
+ extern pid_t process_leader(pid_t pid);
+ extern int process_tasks(pid_t pid, pid_t **ret_tasks, size_t *ret_n);
+ extern int process_stopped(pid_t pid);
++extern void wait_for_proc(pid_t pid);
+ extern enum process_status process_status(pid_t pid);
+ extern void trace_set_options(struct process *proc, pid_t pid);
+ extern void trace_me(void);
+diff -urp ltrace-0.5/proc.c ltrace-0.5-pm/proc.c
+--- ltrace-0.5/proc.c	2012-02-29 01:54:32.454467244 +0100
++++ ltrace-0.5-pm/proc.c	2012-02-29 01:42:21.352011153 +0100
+@@ -27,7 +27,6 @@ open_program(char *filename, pid_t pid,
+ 	}
+ 
+ 	proc->filename = strdup(filename);
+-	proc->breakpoints_enabled = -1;
+ 	proc->pid = pid;
+ 
+ 	add_process(proc);
+@@ -37,6 +36,7 @@ open_program(char *filename, pid_t pid,
+ 	}
+ 
+ 	if (proc->leader == proc)
++		trace_set_options(proc, proc->pid);
+ 		if (breakpoints_init(proc, enable)) {
+ 			fprintf(stderr, "failed to init breakpoints %d\n",
+ 				proc->pid);
+@@ -69,11 +69,10 @@ open_one_pid(pid_t pid)
+ 	return 0;
+ }
+ 
+-enum pcb_status
++static enum pcb_status
+ start_one_pid(struct process * proc, void * data)
+ {
+ 	continue_process(proc->pid);
+-	proc->breakpoints_enabled = 1;
+ 	return pcb_cont;
+ }
+ 
+@@ -144,7 +143,6 @@ void open_forked_pid(pid_t pid, int earl
+ 	proc->early = early;
+ #ifdef __powerpc__
+ 	breakpoints_init(proc, 1);
+-	proc->breakpoints_enabled = 1;
+ #endif
+ }
+ 
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-pm/process_event.c
+--- ltrace-0.5/process_event.c	2012-02-29 01:54:32.504468755 +0100
++++ ltrace-0.5-pm/process_event.c	2012-02-29 01:48:25.723379081 +0100
+@@ -350,9 +350,6 @@ static void process_syscall(struct event
+ 			output_left(LT_TOF_SYSCALL, event->proc,
+ 				    sysname(event->proc, event->e_un.sysnum));
+ 		}
+-		if (event->proc->breakpoints_enabled == 0) {
+-			enable_all_breakpoints(event->proc);
+-		}
+ 			callstack_push_syscall(event->proc, event->e_un.sysnum);
+ 	}
+ 	continue_after_syscall(event->proc, event->e_un.sysnum, 0);
+@@ -360,7 +357,6 @@ static void process_syscall(struct event
+ 
+ static void process_exec(struct event * event) {
+ 	struct process * proc = event->proc;
+-	pid_t saved_pid;
+ 
+ 	if (proc->state == STATE_IGNORED) {
+ 		untrace_pid(proc->pid);
+@@ -373,10 +369,7 @@ static void process_exec(struct event *
+ 	proc->arch_ptr = NULL;
+ 	free(proc->filename);
+ 	proc->filename = pid2name(proc->pid);
+-	saved_pid = proc->pid;
+-	proc->pid = 0;
+ 	breakpoints_init(proc, 0);
+-	proc->pid = saved_pid;
+ 	proc->callstack_depth = 0;
+ 	continue_process(proc->pid);
+ }
+@@ -511,6 +504,7 @@ static void process_breakpoint(struct ev
+ 	}
+ 
+ 	if ((sbp = address2bpstruct(leader, event->e_un.brk_addr))) {
++		breakpoint_on_hit(sbp, event->proc);
+ 		if (sbp->libsym == NULL) {
+ 			continue_after_breakpoint(event->proc, sbp);
+ 			return;
+@@ -527,12 +521,6 @@ static void process_breakpoint(struct ev
+ 			output_left(LT_TOF_FUNCTION, event->proc, sbp->libsym->name);
+ 			callstack_push_symfunc(event->proc, sbp->libsym);
+ 		}
+-#ifdef PLT_REINITALISATION_BP
+-		if (event->proc->need_to_reinitialize_breakpoints
+-		    && (strcmp(sbp->libsym->name, PLTs_initialized_by_here) ==
+-			0))
+-			reinitialize_breakpoints(event->proc);
+-#endif
+ 
+ 		continue_after_breakpoint(event->proc, sbp);
+ 		return;
+diff -urp ltrace-0.5/sysdeps/linux-gnu/trace.c ltrace-0.5-pm/sysdeps/linux-gnu/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/trace.c	2012-02-29 01:54:32.494468452 +0100
++++ ltrace-0.5-pm/sysdeps/linux-gnu/trace.c	2012-02-29 01:47:18.571348726 +0100
+@@ -32,6 +32,29 @@ void trace_me(void)
+ 	}
+ }
+ 
++/* There's a (hopefully) brief period of time after the child process
++ * exec's when we can't trace it yet.  Here we wait for kernel to
++ * prepare the process.  */
++void
++wait_for_proc(pid_t pid)
++{
++	size_t i;
++	for (i = 0; i < 100; ++i) {
++		/* We read from memory address 0, but that shouldn't
++		 * be a problem: the reading will just fail.  We are
++		 * looking for a particular reason of failure.  */
++		if (ptrace(PTRACE_PEEKTEXT, pid, 0, 0) != -1
++		    || errno != ESRCH)
++			return;
++
++		usleep(1000);
++	}
++
++	fprintf(stderr, "\
++I consistently fail to read a word from the freshly launched process.\n\
++I'll now try to proceed with tracing, but this shouldn't be happening.\n");
++}
++
+ int
+ trace_pid(pid_t pid) {
+ 	if (ptrace(PTRACE_ATTACH, pid, 1, 0) < 0) {
+diff -urp ltrace-0.5/wait_for_something.c ltrace-0.5-pm/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c	2012-02-29 01:54:32.494468452 +0100
++++ ltrace-0.5-pm/wait_for_something.c	2012-02-29 01:42:39.892570431 +0100
+@@ -212,17 +212,10 @@ struct event *wait_for_something(void)
+ 		return &event;
+ 	}
+ 	get_arch_dep(event.proc);
+-	if (event.proc->breakpoints_enabled == -1)
+-		trace_set_options(event.proc, event.proc->pid);
+ 
+ 	struct process *leader = event.proc->leader;
+ 	if (leader == event.proc) {
+-		if (event.proc->breakpoints_enabled == -1) {
+-			event.thing = LT_EV_NONE;
+-			enable_all_breakpoints(event.proc);
+-			continue_process(event.proc->pid);
+-			return &event;
+-		} else if (!event.proc->libdl_hooked) {
++		if (!event.proc->libdl_hooked) {
+ 			/* debug struct may not have been written yet.. */
+ 			if (linkmap_init(event.proc, &main_lte) == 0) {
+ 				event.proc->libdl_hooked = 1;

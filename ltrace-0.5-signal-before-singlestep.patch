@@ -1,0 +1,249 @@
+diff -urp ltrace-0.5/ltrace.h ltrace-0.5-64/ltrace.h
+--- ltrace-0.5/ltrace.h	2011-10-25 09:15:34.000000000 -0400
++++ ltrace-0.5-64/ltrace.h	2011-10-25 09:02:00.000000000 -0400
+@@ -280,6 +280,7 @@ extern void disable_breakpoint(struct pr
+ extern int syscall_p(struct process *proc, int status, int *sysnum);
+ extern void continue_process(pid_t pid);
+ extern void continue_after_signal(pid_t pid, int signum);
++extern void continue_after_syscall(struct process *proc, int sysnum, int ret_p);
+ extern void continue_after_breakpoint(struct process *proc, struct breakpoint *sbp);
+ extern void continue_after_vfork(struct process * proc);
+ extern void ltrace_exiting(void);
+diff -urp ltrace-0.5/process_event.c ltrace-0.5-64/process_event.c
+--- ltrace-0.5/process_event.c	2011-10-25 09:15:34.000000000 -0400
++++ ltrace-0.5-64/process_event.c	2011-10-24 18:14:00.000000000 -0400
+@@ -250,7 +250,9 @@ void process_event(struct event *event)
+ 
+ 		/* Note: the previous handler has a chance to alter
+ 		 * the event.  */
+-		if (event->proc->leader != NULL) {
++		if (event->proc != NULL
++		    && event->proc->leader != NULL
++		    && event->proc != event->proc->leader) {
+ 			event = call_handler(event->proc->leader, event);
+ 			if (event == NULL)
+ 				/* It was handled.  */
+@@ -353,7 +360,7 @@ static void process_syscall(struct event
+ 		}
+ 			callstack_push_syscall(event->proc, event->e_un.sysnum);
+ 	}
+-	continue_process(event->proc->pid);
++	continue_after_syscall(event->proc, event->e_un.sysnum, 0);
+ }
+ 
+ static void process_exec(struct event * event) {
+@@ -408,13 +415,16 @@ static void process_sysret(struct event 
+ 		if (opt_T || opt_c) {
+ 			calc_time_spent(event->proc);
+ 		}
++		assert(event->proc->callstack_depth > 0);
++		unsigned d = event->proc->callstack_depth - 1;
++		assert(event->proc->callstack[d].is_syscall);
+ 		callstack_pop(event->proc);
+ 		if (opt_S) {
+ 			output_right(LT_TOF_SYSCALLR, event->proc,
+ 				sysname(event->proc, event->e_un.sysnum));
+ 		}
+ 	}
+-	continue_process(event->proc->pid);
++	continue_after_syscall(event->proc, event->e_un.sysnum, 1);
+ }
+ 
+ static void process_breakpoint(struct event *event)
+diff -urp ltrace-0.5/sysdeps/linux-gnu/trace.c ltrace-0.5-64/sysdeps/linux-gnu/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/trace.c	2011-10-25 09:15:34.000000000 -0400
++++ ltrace-0.5-64/sysdeps/linux-gnu/trace.c	2011-10-25 09:01:30.000000000 -0400
+@@ -22,6 +22,7 @@
+ #include "ltrace.h"
+ #include "options.h"
+ #include "sysdep.h"
++#include "debug.h"
+ 
+ void trace_me(void)
+ {
+@@ -118,6 +128,7 @@ struct pid_task {
+ 	int got_event : 1;
+ 	int delivered : 1;
+ 	int vforked : 1;
++	int sysret : 1;
+ } * pids;
+ 
+ struct pid_set {
+@@ -209,10 +209,14 @@ task_stopped(struct process * task, void
+ 	case ps_invalid:
+ 	case ps_tracing_stop:
+ 	case ps_zombie:
++	case ps_sleeping:
+ 		return pcb_cont;
+-	default:
++	case ps_stop:
++	case ps_other:
+ 		return pcb_stop;
+ 	}
++
++	abort();
+ }
+ 
+ /* Task is blocked if it's stopped, or if it's a vfork parent.  */
+@@ -322,9 +334,11 @@ process_stopping_done(struct process_sto
+ {
+ 	size_t i;
+ 	if (!self->exiting) {
++		debug(1, "pid=%d", self->task_enabling_breakpoint->pid);
+ 		for (i = 0; i < self->pids.count; ++i)
+ 			if (self->pids.tasks[i].pid != 0
+-			    && self->pids.tasks[i].delivered)
++			    && (self->pids.tasks[i].delivered
++				|| self->pids.tasks[i].sysret))
+ 				continue_process(self->pids.tasks[i].pid);
+ 		continue_process(self->task_enabling_breakpoint->pid);
+ 		destroy_event_handler(leader);
+@@ -493,6 +514,14 @@ all_stops_accountable(struct pid_set * p
+ 	return 1;
+ }
+ 
++static void
++singlestep(struct process * proc)
++{
++	debug(1, "PTRACE_SINGLESTEP");
++	if (ptrace(PTRACE_SINGLESTEP, proc->pid, 0, 0))
++		perror("PTRACE_SINGLESTEP");
++}
++
+ /* This event handler is installed when we are in the process of
+  * stopping the whole thread group to do the pointer re-enablement for
+  * one of the threads.  We pump all events to the queue for later
+@@ -520,23 +551,40 @@ process_stopping_on_event(Event_Handler 
+ 	if (event_exit_p(event) && task_info != NULL)
+ 		task_info->pid = 0;
+ 
++	/* Always handle sysrets.  Whether sysret occurred and what
++	 * sys it rets from may need to be determined based on process
++	 * stack, so we need to keep that in sync with reality.  Note
++	 * that we don't continue the process after the sysret is
++	 * handled.  See continue_after_syscall.  */
++	if (event != NULL && event->thing == LT_EV_SYSRET) {
++		debug(1, "%d LT_EV_SYSRET", event->proc->pid);
++		event_to_queue = 0;
++		task_info->sysret = 1;
++	}
++
+ 	switch (state) {
+ 	case psh_stopping:
+ 		/* If everyone is stopped, singlestep.  */
+ 		if (each_task(leader, &task_blocked, &self->pids) == NULL) {
+ 			if (sbp->enabled)
+ 				disable_breakpoint(teb, sbp);
+-			if (ptrace(PTRACE_SINGLESTEP, teb->pid, 0, 0))
+-				perror("PTRACE_SINGLESTEP");
++			singlestep(teb);
+ 			self->state = state = psh_singlestep;
+ 		}
+ 		break;
+ 
+-	case psh_singlestep: {
++	case psh_singlestep:
+ 		/* In singlestep state, breakpoint signifies that we
+ 		 * have now stepped, and can re-enable the breakpoint.  */
+ 		if (event != NULL
+ 		    && task == self->task_enabling_breakpoint) {
++
++			/* This is not the singlestep that we are waiting for.  */
++			if (event->thing == LT_EV_SIGNAL) {
++				singlestep(task);
++				break;
++			}
++
+ 			/* Essentially we don't care what event caused
+ 			 * the thread to stop.  We can do the
+ 			 * re-enablement now.  */
+@@ -561,7 +611,6 @@ process_stopping_on_event(Event_Handler 
+ 				event = NULL; // handled
+ 		} else
+ 			break;
+-	}
+ 
+ 		/* fall-through */
+ 
+@@ -870,6 +920,23 @@ continue_after_vfork(struct process * pr
+ 	change_process_leader(proc, proc->parent->leader);
+ }
+ 
++static int
++is_mid_stopping(struct process *proc)
++{
++	return proc != NULL
++		&& proc->event_handler != NULL
++		&& proc->event_handler->on_event == &process_stopping_on_event;
++}
++
++void
++continue_after_syscall(struct process * proc, int sysnum, int ret_p)
++{
++	/* Don't continue if we are mid-stopping.  */
++	if (ret_p && (is_mid_stopping(proc) || is_mid_stopping(proc->leader)))
++		return;
++	continue_process(proc->pid);
++}
++
+ /* If ltrace gets SIGINT, the processes directly or indirectly run by
+  * ltrace get it too.  We just have to wait long enough for the signal
+  * to be delivered and the process terminated, which we notice and
+diff --git a/testsuite/ltrace.main/hello-vfork.c b/testsuite/ltrace.main/hello-vfork.c
+new file mode 100644
+index 0000000..228c052
+--- /dev/null
++++ b/testsuite/ltrace.main/hello-vfork.c
+@@ -0,0 +1,11 @@
++/* Copyright (C) 2008, Red Hat, Inc.
++ * Written by Denys Vlasenko */
++#include <stdio.h>
++#include <unistd.h>
++
++int main() {
++        int r = vfork();
++        fprintf(stderr, "vfork():%d\n", r);
++        _exit(0);
++}
++
+diff --git a/testsuite/ltrace.main/hello-vfork.exp b/testsuite/ltrace.main/hello-vfork.exp
+new file mode 100644
+index 0000000..12c9ca3
+--- /dev/null
++++ b/testsuite/ltrace.main/hello-vfork.exp
+@@ -0,0 +1,35 @@
++# This file was written by Yao Qi <qiyao@cn.ibm.com>.
++
++set testfile "hello-vfork"
++set srcfile ${testfile}.c
++set binfile ${testfile}
++
++
++if [get_compiler_info $binfile] {
++  return -1
++}
++
++verbose "compiling source file now....."
++if { [ltrace_compile $srcdir/$subdir/$srcfile $objdir/$subdir/$binfile executable debug ] != ""} {
++  send_user "Testcase compile failed, so all tests in this file will automatically fail.\n"
++}
++
++# set options for ltrace.
++ltrace_options "-f"
++
++# Run PUT for ltarce.
++set exec_output [ltrace_runtest $objdir/$subdir $objdir/$subdir/$binfile]
++
++# Check the output of this program.
++verbose "ltrace runtest output: $exec_output\n"
++if [regexp {ELF from incompatible architecture} $exec_output] {
++	fail "32-bit ltrace can not perform on 64-bit PUTs and rebuild ltrace in 64 bit mode!"
++	return 
++} elseif [ regexp {Couldn't get .hash data} $exec_output ] {
++	fail "Couldn't get .hash data!"
++	return
++}
++
++# Verify the output by checking numbers of print in main-vfork.ltrace.
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "_exit" 2
++ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace "vfork resumed" 2

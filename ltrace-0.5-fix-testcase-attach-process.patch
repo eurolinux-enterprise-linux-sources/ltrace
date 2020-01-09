@@ -1,0 +1,10 @@
+--- ltrace-0.5/testsuite/ltrace.minor/attach-process.exp	2006-03-13 17:12:01.000000000 -0600
++++ ltrace-0.5-fix-attach/testsuite/ltrace.minor/attach-process.exp	2012-04-06 23:32:34.683127672 -0500
+@@ -33,6 +33,6 @@ if [regexp {ELF from incompatible archit
+ 
+ # Verify the output in attach-process.ltrace by checking the number 
+ # of sleep.
+-set pattern "sleep"
++set pattern {'^[0-9]* sleep'}
+ ltrace_verify_output ${srcdir}/${subdir}/${testfile}.ltrace $pattern 1
+ 

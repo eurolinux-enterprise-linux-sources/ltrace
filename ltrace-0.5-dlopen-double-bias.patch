@@ -1,0 +1,12 @@
+diff -up ./sysdeps/linux-gnu/proc.c~ ./sysdeps/linux-gnu/proc.c
+--- ./sysdeps/linux-gnu/proc.c~	2012-03-23 13:10:01.420517390 +0100
++++ ./sysdeps/linux-gnu/proc.c	2012-04-03 17:28:33.168428888 +0200
+@@ -721,7 +721,7 @@ linkmap_init(struct process *proc, struc
+ 	}
+ 
+ 	GElf_Addr faddr;
+-	if (deref_opd(proc, rdbg.r_brk, &faddr, rdbg.r_ldbase) < 0) {
++	if (deref_opd(proc, rdbg.r_brk, &faddr, 0) < 0) {
+ 		fprintf(stderr, "Can't load r_brk address from OPD\n");
+ 		return -1;
+ 	}

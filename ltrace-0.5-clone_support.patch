@@ -1,0 +1,826 @@
+diff -up ltrace-0.5/dict.c.clone_support ltrace-0.5/dict.c
+--- ltrace-0.5/dict.c.clone_support	2009-09-28 08:23:09.001286332 +0200
++++ ltrace-0.5/dict.c	2009-09-28 08:23:08.219060631 +0200
+@@ -166,3 +166,36 @@ int dict_key_cmp_int(void *key1, void *k
+ {
+ 	return key1 - key2;
+ }
++
++struct dict *dict_clone(struct dict *old, void * (*key_clone)(void*), void * (*value_clone)(void*)) {
++	struct dict *d;
++	int i;
++
++	d = malloc(sizeof(struct dict));
++	if (!d) {
++		perror("malloc()");
++		exit(1);
++	}
++	memcpy(d, old, sizeof(struct dict));
++	for (i = 0; i < DICTTABLESIZE; i++) {   /* better use memset()? */
++		struct dict_entry *de_old;
++		struct dict_entry **de_new;
++
++		de_old = old->buckets[i];
++		de_new = &d->buckets[i];
++		while (de_old) {
++			*de_new = malloc(sizeof(struct dict_entry));
++			if (!*de_new) {
++				perror("malloc()");
++				exit(1);
++			}
++			memcpy(*de_new, de_old, sizeof(struct dict_entry));
++			(*de_new)->key = key_clone(de_old->key);
++			(*de_new)->value = value_clone(de_old->value);
++			de_new = &(*de_new)->next;
++			de_old = de_old->next;
++		}
++	}
++	return d;
++}
++
+diff -up ltrace-0.5/dict.h.clone_support ltrace-0.5/dict.h
+--- ltrace-0.5/dict.h.clone_support	2009-09-28 08:23:08.985054819 +0200
++++ ltrace-0.5/dict.h	2009-09-28 08:23:08.433055475 +0200
+@@ -17,3 +17,4 @@ extern unsigned int dict_key2hash_string
+ extern int dict_key_cmp_string(void *key1, void *key2);
+ extern unsigned int dict_key2hash_int(void *key);
+ extern int dict_key_cmp_int(void *key1, void *key2);
++extern struct dict * dict_clone(struct dict *old, void * (*key_clone)(void*), void * (*value_clone)(void*));
+diff -up ltrace-0.5/ltrace.h.clone_support ltrace-0.5/ltrace.h
+--- ltrace-0.5/ltrace.h.clone_support	2009-09-28 08:23:08.974108792 +0200
++++ ltrace-0.5/ltrace.h	2009-09-28 10:34:10.094052887 +0200
+@@ -99,7 +98,16 @@ struct callstack_element {
+ 
+ #define MAX_CALLDEPTH 64
+ 
++typedef enum Process_State Process_State;
++enum Process_State {
++	STATE_ATTACHED,
++	STATE_BEING_CREATED,
++	STATE_IGNORED  /* ignore this process (it's a fork and no -f was used) */
++};
++
+ struct process {
++	Process_State state;
++	struct process *parent; /* needed by STATE_BEING_CREATED */
+ 	char *filename;
+ 	pid_t pid;
+ 	struct dict *breakpoints;
+@@ -141,13 +149,17 @@ struct event {
+ 		LT_EV_EXIT_SIGNAL,
+ 		LT_EV_SYSCALL,
+ 		LT_EV_SYSRET,
+-		LT_EV_BREAKPOINT
++		LT_EV_CLONE,
++		LT_EV_EXEC,
++		LT_EV_BREAKPOINT,
++		LT_EV_NEW
+ 	} thing;
+ 	union {
+ 		int ret_val;	/* _EV_EXIT */
+ 		int signum;	/* _EV_SIGNAL, _EV_EXIT_SIGNAL */
+ 		int sysnum;	/* _EV_SYSCALL, _EV_SYSRET */
+ 		void *brk_addr;	/* _EV_BREAKPOINT */
++		int newpid;	/* _EV_CLONE, _EV_NEW */
+ 	} e_un;
+ };
+ 
+@@ -182,7 +194,7 @@ extern void show_summary(void);
+ 
+ /* Arch-dependent stuff: */
+ extern char *pid2name(pid_t pid);
+-extern void trace_set_options(struct process *proc, pid_t pid, int option);
++extern void trace_set_options(struct process *proc, pid_t pid);
+ extern void trace_me(void);
+ extern int trace_pid(pid_t pid);
+ extern void untrace_pid(pid_t pid);
+@@ -193,8 +205,6 @@ extern void *get_stack_pointer(struct pr
+ extern void *get_return_addr(struct process *proc, void *stack_pointer);
+ extern void enable_breakpoint(pid_t pid, struct breakpoint *sbp);
+ extern void disable_breakpoint(pid_t pid, const struct breakpoint *sbp);
+-extern int fork_p(struct process *proc, int sysnum);
+-extern int exec_p(struct process *proc, int sysnum);
+ extern int syscall_p(struct process *proc, int status, int *sysnum);
+ extern void continue_process(pid_t pid);
+ extern void continue_after_signal(pid_t pid, int signum);
+@@ -206,6 +216,7 @@ extern void save_register_args(enum tof 
+ extern int umovestr(struct process *proc, void *addr, int len, void *laddr);
+ extern int ffcheck(void *maddr);
+ extern void *sym2addr(struct process *, struct library_symbol *);
++extern struct process *pid2proc(int pid);
+ 
+ #if 0				/* not yet */
+ extern int umoven(struct process *proc, void *addr, int len, void *laddr);
+diff -up ltrace-0.5/proc.c.clone_support ltrace-0.5/proc.c
+--- ltrace-0.5/proc.c.clone_support	2009-09-28 08:23:08.972930071 +0200
++++ ltrace-0.5/proc.c	2009-09-28 09:05:07.753180237 +0200
+@@ -20,7 +20,7 @@ struct process *open_program(char *filen
+ 		perror("malloc");
+ 		exit(1);
+ 	}
+-	proc->filename = filename;
++	proc->filename = strdup(filename);
+ 	proc->breakpoints_enabled = -1;
+ 	breakpoints_init(proc); 
+ 	proc->pid = pid;
+@@ -52,8 +52,9 @@ void open_pid(pid_t pid, int verbose)
+ 		return;
+ 	}
+ #endif
+-	proc = open_program(filename, 0);
+-	proc->pid = pid;
++	proc = open_program(filename, pid);
++	continue_process(pid);
++	proc->breakpoints_enabled = 1;
+ }
+ 
+ void open_forked_pid(pid_t pid, int early)
+diff -up ltrace-0.5/process_event.c.clone_support ltrace-0.5/process_event.c
+--- ltrace-0.5/process_event.c.clone_support	2009-09-28 08:23:08.965401683 +0200
++++ ltrace-0.5/process_event.c	2009-09-28 10:47:22.343181042 +0200
+@@ -25,6 +25,8 @@ static void process_exit(struct event *e
+ static void process_exit_signal(struct event *event);
+ static void process_syscall(struct event *event);
+ static void process_sysret(struct event *event);
++static void process_clone(struct event *event);
++static void process_exec(struct event *event);
+ static void process_breakpoint(struct event *event);
+ static void remove_proc(struct process *proc);
+ 
+@@ -33,6 +35,125 @@ static void callstack_push_symfunc(struc
+ 				   struct library_symbol *sym);
+ static void callstack_pop(struct process *proc);
+ 
++/* TODO */
++void * address_clone(void * addr) {
++	return addr;
++}
++
++void * breakpoint_clone(void * bp) {
++	struct breakpoint * b;
++	b = malloc(sizeof(struct breakpoint));
++	if (!b) {
++		perror("malloc()");
++		exit(1);
++	}
++	memcpy(b, bp, sizeof(struct breakpoint));
++	return b;
++}
++
++typedef struct Pending_New Pending_New;
++
++struct Pending_New {
++	pid_t pid;
++	Pending_New * next;
++};
++
++static Pending_New * pending_news = NULL;
++
++static int pending_new(pid_t pid) {
++	Pending_New * p = pending_news;
++	while (p) {
++		if (p->pid == pid) {
++			return 1;
++		}
++		p = p->next;
++	}
++	return 0;
++}
++
++static void pending_new_insert(pid_t pid) {
++	Pending_New * p = malloc(sizeof(Pending_New));
++	if (!p) {
++		perror("malloc()");
++		exit(1);
++	}
++	p->pid = pid;
++	p->next = pending_news;
++	pending_news = p;
++}
++
++static void pending_new_remove(pid_t pid) {
++	Pending_New *p, *pred;
++	p = pending_news;
++	if (p->pid == pid) {
++		pending_news = p->next;
++		free(p);
++	} else {
++		while (p) {
++			if (p->pid == pid) {
++				pred->next = p->next;
++				free(p);
++			}
++			pred = p;
++			p = p->next;
++		}
++	}
++}
++
++static void process_clone(struct event * event) {
++	struct process *p;
++
++	p = malloc(sizeof(struct process));
++	if (!p) {
++		perror("malloc()");
++		exit(1);
++	}
++	memcpy(p, event->proc, sizeof(struct process));
++	p->breakpoints = dict_clone(event->proc->breakpoints, address_clone, breakpoint_clone);
++	p->pid = event->e_un.newpid;
++	p->parent = event->proc;
++
++	if (pending_new(p->pid)) {
++		pending_new_remove(p->pid);
++		if (p->breakpoint_being_enabled) {
++			enable_breakpoint(p->pid, p->breakpoint_being_enabled);
++			p->breakpoint_being_enabled = NULL;
++		}
++		if (event->proc->state == STATE_ATTACHED && opt_f) {
++			p->state = STATE_ATTACHED;
++		} else {
++			p->state = STATE_IGNORED;
++		}
++		continue_process(p->pid);
++		p->next = list_of_processes;
++		list_of_processes = p;
++	} else {
++		p->state = STATE_BEING_CREATED;
++		p->next = list_of_processes;
++		list_of_processes = p;
++	}
++	continue_process(event->proc->pid);
++}
++
++static void process_new(struct event * event) {
++	struct process * proc = pid2proc(event->e_un.newpid);
++	if (!proc) {
++		pending_new_insert(event->e_un.newpid);
++	} else {
++		assert(proc->state == STATE_BEING_CREATED);
++		if (proc->breakpoint_being_enabled) {
++			enable_breakpoint(proc->pid, proc->breakpoint_being_enabled);
++			proc->breakpoint_being_enabled = NULL;
++		}
++		if (opt_f) {
++			proc->state = STATE_ATTACHED;
++		} else {
++			proc->state = STATE_IGNORED;
++		}
++		continue_process(proc->pid);
++	}
++}
++
+ static char *shortsignal(struct process *proc, int signum)
+ {
+ 	static char *signalent0[] = {
+@@ -115,10 +236,22 @@ void process_event(struct event *event)
+ 		      event->e_un.sysnum);
+ 		process_sysret(event);
+ 		return;
++	case LT_EV_CLONE:
++		debug(1, "event: clone (%u)", event->e_un.newpid);
++		process_clone(event);
++		return;
++	case LT_EV_EXEC:
++		debug(1, "event: exec()");
++		process_exec(event);
++		return;
+ 	case LT_EV_BREAKPOINT:
+ 		debug(1, "event: breakpoint");
+ 		process_breakpoint(event);
+ 		return;
++	case LT_EV_NEW:
++		debug(1, "event: new process");
++		process_new(event);
++		return;
+ 	default:
+ 		fprintf(stderr, "Error! unknown event?\n");
+ 		exit(1);
+@@ -132,26 +265,31 @@ static void process_signal(struct event 
+ 		disable_all_breakpoints(event->proc);
+ 		untrace_pid(pid);
+ 		remove_proc(event->proc);
+-		continue_after_signal(pid, event->e_un.signum);
+ 		return;
+ 	}
+-	output_line(event->proc, "--- %s (%s) ---",
+-		    shortsignal(event->proc, event->e_un.signum),
+-		    strsignal(event->e_un.signum));
++	if (event->proc->state != STATE_IGNORED) {
++		output_line(event->proc, "--- %s (%s) ---",
++			    shortsignal(event->proc, event->e_un.signum),
++			    strsignal(event->e_un.signum));
++	}
+ 	continue_after_signal(event->proc->pid, event->e_un.signum);
+ }
+ 
+ static void process_exit(struct event *event)
+ {
+-	output_line(event->proc, "+++ exited (status %d) +++",
+-		    event->e_un.ret_val);
++	if (event->proc->state != STATE_IGNORED) {
++		output_line(event->proc, "+++ exited (status %d) +++",
++			    event->e_un.ret_val);
++	}
+ 	remove_proc(event->proc);
+ }
+ 
+ static void process_exit_signal(struct event *event)
+ {
+-	output_line(event->proc, "+++ killed by %s +++",
+-		    shortsignal(event->proc, event->e_un.signum));
++	if (event->proc->state != STATE_IGNORED) {
++		output_line(event->proc, "+++ killed by %s +++",
++			    shortsignal(event->proc, event->e_un.signum));
++	}
+ 	remove_proc(event->proc);
+ }
+ 
+@@ -181,20 +319,42 @@ static void remove_proc(struct process *
+ 
+ static void process_syscall(struct event *event)
+ {
+-	if (opt_S) {
+-		output_left(LT_TOF_SYSCALL, event->proc,
+-			    sysname(event->proc, event->e_un.sysnum));
+-	}
+-	if (fork_p(event->proc, event->e_un.sysnum)
+-	    || exec_p(event->proc, event->e_un.sysnum)) {
+-		disable_all_breakpoints(event->proc);
+-	} else if (event->proc->breakpoints_enabled == 0) {
+-		enable_all_breakpoints(event->proc);
++	if (event->proc->state != STATE_IGNORED) {
++		if (opt_S) {
++			output_left(LT_TOF_SYSCALL, event->proc,
++				sysname(event->proc, event->e_un.sysnum));
++		}
++		if (event->proc->breakpoints_enabled == 0) {
++			enable_all_breakpoints(event->proc);
++		}
++			callstack_push_syscall(event->proc, event->e_un.sysnum);
+ 	}
+-	callstack_push_syscall(event->proc, event->e_un.sysnum);
+ 	continue_process(event->proc->pid);
+ }
+ 
++static void process_exec(struct event * event) {
++	struct process * proc = event->proc;
++	pid_t saved_pid;
++
++	if (proc->state == STATE_IGNORED) {
++		untrace_pid(proc->pid);
++		remove_proc(proc);
++		return;
++	}
++	output_line(proc, "--- Called exec() ---");
++	proc->mask_32bit = 0;
++	proc->personality = 0;
++	proc->arch_ptr = NULL;
++	free(proc->filename);
++	proc->filename = pid2name(proc->pid);
++	saved_pid = proc->pid;
++	proc->pid = 0;
++	breakpoints_init(proc);
++	proc->pid = saved_pid;
++	proc->callstack_depth = 0;
++	continue_process(proc->pid);
++}
++
+ struct timeval current_time_spent;
+ 
+ static void calc_time_spent(struct process *proc)
+@@ -220,13 +380,15 @@ static void calc_time_spent(struct proce
+ 
+ static void process_sysret(struct event *event)
+ {
+-	if (opt_T || opt_c) {
+-		calc_time_spent(event->proc);
+-	}
+-	callstack_pop(event->proc);
+-	if (opt_S) {
+-		output_right(LT_TOF_SYSCALLR, event->proc,
+-			     sysname(event->proc, event->e_un.sysnum));
++	if (event->proc->state != STATE_IGNORED) {
++		if (opt_T || opt_c) {
++			calc_time_spent(event->proc);
++		}
++		callstack_pop(event->proc);
++		if (opt_S) {
++			output_right(LT_TOF_SYSCALLR, event->proc,
++				sysname(event->proc, event->e_un.sysnum));
++		}
+ 	}
+ 	continue_process(event->proc->pid);
+ }
+@@ -298,28 +460,32 @@ static void process_breakpoint(struct ev
+ 			for (j = event->proc->callstack_depth - 1; j > i; j--) {
+ 				callstack_pop(event->proc);
+ 			}
+-			if (opt_T || opt_c) {
+-				calc_time_spent(event->proc);
++			if (event->proc->state != STATE_IGNORED) {
++				if (opt_T || opt_c) {
++					calc_time_spent(event->proc);
++				}
+ 			}
+ 			callstack_pop(event->proc);
+ 			event->proc->return_addr = event->e_un.brk_addr;
+-			output_right(LT_TOF_FUNCTIONR, event->proc,
+-				     event->proc->callstack[i].c_un.libfunc->
+-				     name);
++			if (event->proc->state != STATE_IGNORED) {
++				output_right(LT_TOF_FUNCTIONR, event->proc,
++					     event->proc->callstack[i].c_un.libfunc->name);
++			}
+ 			continue_after_breakpoint(event->proc,
+ 						  address2bpstruct(event->proc,
+-								   event->e_un.
+-								   brk_addr));
++								   event->e_un.brk_addr));
+ 			return;
+ 		}
+ 	}
+ 
+ 	if ((sbp = address2bpstruct(event->proc, event->e_un.brk_addr))) {
+-		event->proc->stack_pointer = get_stack_pointer(event->proc);
+-		event->proc->return_addr =
+-		    get_return_addr(event->proc, event->proc->stack_pointer);
+-		output_left(LT_TOF_FUNCTION, event->proc, sbp->libsym->name);
+-		callstack_push_symfunc(event->proc, sbp->libsym);
++		if (event->proc->state != STATE_IGNORED) {
++			event->proc->stack_pointer = get_stack_pointer(event->proc);
++			event->proc->return_addr =
++				get_return_addr(event->proc, event->proc->stack_pointer);
++			output_left(LT_TOF_FUNCTION, event->proc, sbp->libsym->name);
++			callstack_push_symfunc(event->proc, sbp->libsym);
++		}
+ #ifdef PLT_REINITALISATION_BP
+ 		if (event->proc->need_to_reinitialize_breakpoints
+ 		    && (strcmp(sbp->libsym->name, PLTs_initialized_by_here) ==
+@@ -331,8 +497,10 @@ static void process_breakpoint(struct ev
+ 		return;
+ 	}
+ 
+-	output_line(event->proc, "unexpected breakpoint at %p",
+-		    (void *)event->e_un.brk_addr);
++	if (event->proc->state != STATE_IGNORED) {
++		output_line(event->proc, "unexpected breakpoint at %p",
++			    (void *)event->e_un.brk_addr);
++	}
+ 	continue_process(event->proc->pid);
+ }
+ 
+diff -up ltrace-0.5/sysdeps/linux-gnu/i386/trace.c.clone_support ltrace-0.5/sysdeps/linux-gnu/i386/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/i386/trace.c.clone_support	2009-09-28 08:23:08.745054999 +0200
++++ ltrace-0.5/sysdeps/linux-gnu/i386/trace.c	2009-09-28 08:23:08.746156265 +0200
+@@ -32,7 +32,8 @@ int syscall_p(struct process *proc, int 
+ 		*sysnum = ptrace(PTRACE_PEEKUSER, proc->pid, 4 * ORIG_EAX, 0);
+ 
+ 		if (proc->callstack_depth > 0 &&
+-		    proc->callstack[proc->callstack_depth - 1].is_syscall) {
++		    proc->callstack[proc->callstack_depth - 1].is_syscall &&
++		    proc->callstack[proc->callstack_depth - 1].c_un.syscall == *sysnum) {
+ 			return 2;
+ 		}
+ 
+diff -up ltrace-0.5/sysdeps/linux-gnu/trace.c.clone_support ltrace-0.5/sysdeps/linux-gnu/trace.c
+--- ltrace-0.5/sysdeps/linux-gnu/trace.c.clone_support	2009-09-28 08:23:08.836074853 +0200
++++ ltrace-0.5/sysdeps/linux-gnu/trace.c	2009-09-28 10:42:27.772273160 +0200
+@@ -6,74 +6,12 @@
+ #include <sys/types.h>
+ #include "ptrace.h"
+ #include <asm/unistd.h>
++#include <linux/ptrace.h>
+ 
+ #include "ltrace.h"
+ #include "options.h"
+ #include "sysdep.h"
+ 
+-static int fork_exec_syscalls[][5] = {
+-	{
+-#ifdef __NR_fork
+-	 __NR_fork,
+-#else
+-	 -1,
+-#endif
+-#ifdef __NR_clone
+-	 __NR_clone,
+-#else
+-	 -1,
+-#endif
+-#ifdef __NR_clone2
+-	 __NR_clone2,
+-#else
+-	 -1,
+-#endif
+-#ifdef __NR_vfork
+-	 __NR_vfork,
+-#else
+-	 -1,
+-#endif
+-#ifdef __NR_execve
+-	 __NR_execve,
+-#else
+-	 -1,
+-#endif
+-	 }
+-#ifdef FORK_EXEC_SYSCALLS
+-	FORK_EXEC_SYSCALLS
+-#endif
+-};
+-
+-/* Returns 1 if the sysnum may make a new child to be created
+- * (ie, with fork() or clone())
+- * Returns 0 otherwise.
+- */
+-int fork_p(struct process *proc, int sysnum)
+-{
+-	unsigned int i;
+-	if (proc->personality
+-	    >= sizeof fork_exec_syscalls / sizeof(fork_exec_syscalls[0]))
+-		return 0;
+-	for (i = 0; i < sizeof(fork_exec_syscalls[0]) / sizeof(int) - 1; ++i)
+-		if (sysnum == fork_exec_syscalls[proc->personality][i])
+-			return 1;
+-	return 0;
+-}
+-
+-/* Returns 1 if the sysnum may make the process exec other program
+- */
+-int exec_p(struct process *proc, int sysnum)
+-{
+-	int i;
+-	if (proc->personality
+-	    >= sizeof fork_exec_syscalls / sizeof(fork_exec_syscalls[0]))
+-		return 0;
+-	i = sizeof(fork_exec_syscalls[0]) / sizeof(int) - 1;
+-	if (sysnum == fork_exec_syscalls[proc->personality][i])
+-		return 1;
+-	return 0;
+-}
+-
+ void trace_me(void)
+ {
+ 	if (ptrace(PTRACE_TRACEME, 0, 1, 0) < 0) {
+@@ -90,35 +28,21 @@ int trace_pid(pid_t pid)
+ 	return 0;
+ }
+ 
+-void trace_set_options(struct process *proc, pid_t pid, int option)
++void trace_set_options(struct process *proc, pid_t pid)
+ {
+-#ifndef PTRACE_SETOPTIONS
+-#define PTRACE_SETOPTIONS 0x4200
+-#endif
+ #ifndef PTRACE_OLDSETOPTIONS
+ #define PTRACE_OLDSETOPTIONS 21
+ #endif
+-#ifndef PTRACE_O_TRACESYSGOOD
+-#define PTRACE_O_TRACESYSGOOD 0x00000001
+-#endif
+-#ifndef PTRACE_O_TRACEFORK
+-#define PTRACE_O_TRACEFORK 0x00000002
+-#endif
+-#ifndef PTRACE_O_TRACEEXEC
+-#define PTRACE_O_TRACEEXEC 0x00000010
+-#endif
+-      
+ 	ulong setoptions = 0;
+ 
+ 	if (proc->tracesysgood & 0x80)
+ 		return;
+  
+-	setoptions |= PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC;
+-	if (TRACE_FORK == option){
+-		setoptions |= PTRACE_O_TRACEFORK;
+-	}
++	setoptions |= PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
++               PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
++               PTRACE_O_TRACEEXEC;
+ 	if (ptrace(PTRACE_SETOPTIONS, pid, 0, setoptions) < 0 &&
+-	    ptrace(PTRACE_OLDSETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD) < 0){
++	    ptrace(PTRACE_OLDSETOPTIONS, pid, 0, setoptions) < 0){
+ 		perror("PTRACE_SETOPTIONS");
+ 		return;
+ 	}
+@@ -192,9 +113,6 @@ int umovestr(struct process *proc, void 
+ 
+ ulong get_child_pid(pid_t pid)
+ {
+-#ifndef PTRACE_GETEVENTMSG
+-#define PTRACE_GETEVENTMSG 0x4201
+-#endif
+         ulong child_pid = 9999;
+                                                                                                                              
+        if( ptrace(PTRACE_GETEVENTMSG, pid, 0, &child_pid) < 0) {
+diff -up ltrace-0.5/wait_for_something.c.clone_support ltrace-0.5/wait_for_something.c
+--- ltrace-0.5/wait_for_something.c.clone_support	2009-09-28 08:23:08.955057624 +0200
++++ ltrace-0.5/wait_for_something.c	2009-09-28 10:50:20.603055872 +0200
+@@ -15,11 +15,67 @@
+ #include "debug.h"
+ 
+ #define FORK_MASK 0x00010000
++
++/* If the system headers did not provide the constants, hard-code the normal
++ *    values.  */
++#ifndef PTRACE_OLDSETOPTIONS
++#define PTRACE_OLDSETOPTIONS    21
++#endif
++#ifndef PTRACE_SETOPTIONS
++#define PTRACE_SETOPTIONS       0x4200
++#endif
++#ifndef PTRACE_GETEVENTMSG
++#define PTRACE_GETEVENTMSG      0x4201
++#endif
++
++/* options set using PTRACE_SETOPTIONS */
++#ifndef PTRACE_O_TRACESYSGOOD
++#define PTRACE_O_TRACESYSGOOD   0x00000001
++#endif
++#ifndef PTRACE_O_TRACEFORK
++#define PTRACE_O_TRACEFORK      0x00000002
++#endif
++#ifndef PTRACE_O_TRACEVFORK
++#define PTRACE_O_TRACEVFORK     0x00000004
++#endif
++#ifndef PTRACE_O_TRACECLONE
++#define PTRACE_O_TRACECLONE     0x00000008
++#endif
++#ifndef PTRACE_O_TRACEEXEC
++#define PTRACE_O_TRACEEXEC      0x00000010
++#endif
++#ifndef PTRACE_O_TRACEVFORKDONE
++#define PTRACE_O_TRACEVFORKDONE 0x00000020
++#endif
++#ifndef PTRACE_O_TRACEEXIT
++#define PTRACE_O_TRACEEXIT      0x00000040
++#endif
++
++/* Wait extended result codes for the above trace options.  */
++#ifndef PTRACE_EVENT_FORK
++#define PTRACE_EVENT_FORK       1
++#endif
++#ifndef PTRACE_EVENT_VFORK
++#define PTRACE_EVENT_VFORK      2
++#endif
++#ifndef PTRACE_EVENT_CLONE
++#define PTRACE_EVENT_CLONE      3
++#endif
++#ifndef PTRACE_EVENT_EXEC
++#define PTRACE_EVENT_EXEC       4
++#endif
++#ifndef PTRACE_EVENT_VFORK_DONE
++#define PTRACE_EVENT_VFORK_DONE 5
++#endif
++#ifndef PTRACE_EVENT_EXIT
++#define PTRACE_EVENT_EXIT       6
++#endif
++
+ static struct event event;
+ 
+ /* This should also update `current_process' */
+ 
+-static struct process *pid2proc(int pid);
++struct process *pid2proc(int pid);
+ void verify(int sig_status);
+ 
+ struct event *wait_for_something(void)
+@@ -32,7 +88,7 @@ struct event *wait_for_something(void)
+ 		debug(1, "No more children");
+ 		exit(0);
+ 	}
+-	pid = wait(&status);
++	pid = waitpid(-1, &status, __WALL);
+ 	if (pid == -1) {
+ 		if (errno == ECHILD) {
+ 			debug(1, "No more children");
+@@ -48,38 +104,17 @@ struct event *wait_for_something(void)
+ 
+ 	debug(3, "signal from pid %u, status %#x", pid, status);
+ 	event.proc = pid2proc(pid);
+-	if (!event.proc) {
+-		if(!opt_f) {
+-			fprintf(stderr, "signal from wrong pid %u ?!?\n", pid);
+-			exit(1);
+-		} else {
+-			/* Parent forked, but we got child's STOP
+-			 * signal first.  */
+-			debug (1, "signal from forked child delivered ahead of time?");
+-
+-			event.thing = LT_EV_NONE;
+-			event.e_un.signum = WSTOPSIG(status);
+-			open_forked_pid(pid, 1);
+-			event.proc = pid2proc(pid);
+-			continue_after_signal(event.proc->pid, event.e_un.signum);
+-			return &event;
+-		}
++	if (!event.proc || event.proc->state == STATE_BEING_CREATED) {
++		event.thing = LT_EV_NEW;
++		event.e_un.newpid = pid;
++		return &event;
+ 	}
+ 	get_arch_dep(event.proc);
+ 	event.proc->instruction_pointer = NULL;
+-	if (!event.proc->old) {
+-		event.proc->old = 1;
+-		if (event.proc->breakpoints_enabled == -1) {
+-			debug (2, "BRANCH: enable breakpoints for the first time");
+-			enable_all_breakpoints(event.proc);
+-			debug (2, "BRANCH: done enabling breakpoints for the first time");
+-		}
++	if (event.proc->breakpoints_enabled == -1) {
++		enable_all_breakpoints(event.proc);
+ 		event.thing = LT_EV_NONE;
+-  		if(opt_f){
+-			trace_set_options(event.proc, event.proc->pid, TRACE_FORK);
+-		}else{
+-			trace_set_options(event.proc, event.proc->pid, 0);
+-		}
++		trace_set_options(event.proc, event.proc->pid);
+ 		continue_process(event.proc->pid);
+ 		return &event;
+ 	}
+@@ -96,6 +131,22 @@ struct event *wait_for_something(void)
+ 		event.thing = LT_EV_SYSRET;
+ 		event.e_un.sysnum = tmp;
+ 		return &event;
++	case -1:
++		event.thing = LT_EV_NONE;
++		continue_process(event.proc->pid);
++		return &event;
++	}
++	if (WIFSTOPPED(status) && ((status>>16 == PTRACE_EVENT_FORK) || (status>>16 == PTRACE_EVENT_VFORK) || (status>>16 == PTRACE_EVENT_CLONE))) {
++		unsigned long data;
++		ptrace(PTRACE_GETEVENTMSG, pid, NULL, &data);
++		event.thing = LT_EV_CLONE;
++		event.e_un.newpid = data;
++		return &event;
++	}
++	/* TODO: check for EVENT_CLONE */
++	if (WIFSTOPPED(status) && (status>>16 == PTRACE_EVENT_EXEC)) {
++		event.thing = LT_EV_EXEC;
++		return &event;
+ 	}
+ 	if (WIFEXITED(status)) {
+ 		event.thing = LT_EV_EXIT;
+@@ -117,51 +168,6 @@ struct event *wait_for_something(void)
+ 		event.e_un.signum = stop_signal;
+ 		return &event;
+ 	}
+-        if(stop_signal == SIGTRAP && (status & FORK_MASK)) {
+-		event.thing = LT_EV_NONE;
+-		event.e_un.signum = stop_signal;
+-		child_pid = (pid_t) get_child_pid(event.proc->pid);
+-                if (child_pid){
+-			debug (3, "fork: get_child_pid gave us %d", child_pid);
+-
+-			struct process *it = list_of_processes;
+-			for (; it != NULL; it = it->next)
+-				if (it->pid == child_pid) {
+-					if (!it->early)
+-						fprintf (stderr,
+-							 "Child %d re-delivered.\n",
+-							 child_pid);
+-					break;
+-				}
+-			if (!it)
+-				open_forked_pid(child_pid, 0);
+-                }
+-                enable_all_breakpoints(event.proc);
+-		continue_after_signal(event.proc->pid, event.e_un.signum);
+-		return &event;
+-	}
+-	if (stop_signal == SIGTRAP){
+-	/* Check whether this SIGTRAP is received just after execve is called for this process */
+-		struct callstack_element *elem;
+-		elem = &event.proc->callstack[event.proc->callstack_depth - 1];
+-		if( elem && elem->is_syscall &&  exec_p(event.proc, elem->c_un.syscall)){
+-			pid_t saved_pid;
+-
+-			event.thing = LT_EV_NONE;
+-			event.e_un.signum = stop_signal;
+-			debug(1,"Placing breakpoints for the new program");
+-			event.proc->mask_32bit = 0;
+-			event.proc->personality = 0;
+-			event.proc->arch_ptr = NULL;
+-			event.proc->filename = pid2name(event.proc->pid);
+-			saved_pid = event.proc->pid;
+-			event.proc->pid = 0;
+-			breakpoints_init(event.proc);
+-			event.proc->pid = saved_pid;
+-			continue_process(event.proc->pid);
+-			return &event;
+-		}
+-	}
+ 
+ 	event.thing = LT_EV_BREAKPOINT;
+ 	if (!event.proc->instruction_pointer) {
+@@ -173,7 +179,7 @@ struct event *wait_for_something(void)
+ 	return &event;
+ }
+ 
+-static struct process *pid2proc(pid_t pid)
++struct process *pid2proc(pid_t pid)
+ {
+ 	struct process *tmp;
+ 
