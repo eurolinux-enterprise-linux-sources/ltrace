@@ -1,7 +1,7 @@
 Summary: Tracks runtime library calls from dynamically linked executables
 Name: ltrace
 Version: 0.7.91
-Release: 1%{?dist}
+Release: 7%{?dist}
 URL: http://ltrace.alioth.debian.org/
 License: GPLv2+
 Group: Development/Debuggers
@@ -17,6 +17,40 @@ Source: ltrace-%{version}.tar.bz2
 # Merge of several upstream commits that fixes compilation on ARM.
 Patch0: ltrace-0.7.91-arm.patch
 
+# Upstream patch that fixes accounting of exec, __libc_start_main and
+# others in -c output.
+Patch1: ltrace-0.7.91-account_execl.patch
+
+# Upstream patch that fixes interpretation of PLT on x86_64 when
+# IRELATIVE slots are present.
+# https://bugzilla.redhat.com/show_bug.cgi?id=844998
+Patch2: ltrace-0.7.91-x86_64-irelative.patch
+
+# Upstream patch that fixes fetching of system call arguments on s390.
+# https://bugzilla.redhat.com/show_bug.cgi?id=844998
+Patch3: ltrace-0.7.91-s390-fetch-syscall.patch
+
+# Upstream patch that enables tracing of IRELATIVE PLT slots on s390.
+# https://bugzilla.redhat.com/show_bug.cgi?id=844998
+Patch4: ltrace-0.7.91-s390-irelative.patch
+
+# Fix for a regression in tracing across fork.  Upstream patch.
+# https://bugzilla.redhat.com/show_bug.cgi?id=1052255
+Patch5: ltrace-0.7.91-ppc64-fork.patch
+
+# Fix crashing a prelinked PPC64 binary which makes PLT calls through
+# slots that ltrace doesn't trace.
+# https://bugzilla.redhat.com/show_bug.cgi?id=1051221
+Patch6: ltrace-0.7.91-breakpoint-on_install.patch
+Patch7: ltrace-0.7.91-ppc64-unprelink.patch
+
+# Man page nits.  Backport of an upstream patch.
+# https://bugzilla.redhat.com/show_bug.cgi?id=866394
+Patch8: ltrace-0.7.91-man.patch
+
+# https://bugzilla.redhat.com/show_bug.cgi?id=1053765
+Patch9: ltrace-0.7.91-cant_open.patch
+
 %description
 Ltrace is a debugging program which runs a specified command until the
 command exits.  While the command is executing, ltrace intercepts and
@@ -30,6 +64,15 @@ execution of processes.
 %prep
 %setup -q -n %{name}-%{version}
 %patch0 -p1
+%patch1 -p1
+%patch2 -p1
+%patch3 -p1
+%patch4 -p1
+%patch5 -p1
+%patch6 -p1
+%patch7 -p1
+%patch8 -p1
+%patch9 -p1
 
 %build
 %configure
@@ -54,6 +97,38 @@ echo ====================TESTING END=====================
 %{_datadir}/ltrace
 
 %changelog
+* Fri Jan 24 2014 Daniel Mach <dmach@redhat.com> - 0.7.91-7
+- Mass rebuild 2014-01-24
+
+* Tue Jan 14 2014 Petr Machata <pmachata@redhat.com> - 0.7.91-6
+- Fix a problem when attempting to trace a command that hasn't been
+  found (ltrace-0.7.91-cant_open.patch)
+
+* Tue Jan 14 2014 Petr Machata <pmachata@redhat.com> - 0.7.91-5
+- Fix crashing a prelinked PPC64 binary which makes PLT calls through
+  slots that ltrace doesn't trace.
+  (ltrace-0.7.91-breakpoint-on_install.patch,
+  ltrace-0.7.91-ppc64-unprelink.patch)
+- Fix a problem in tracing across fork on PPC64
+  (ltrace-0.7.91-ppc64-fork.patch)
+- Fix a couple nits in ltrace.1
+  (ltrace-0.7.91-man.patch)
+
+* Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 0.7.91-4
+- Mass rebuild 2013-12-27
+
+* Wed Dec  4 2013 Petr Machata <pmachata@redhat.com> - 0.7.91-3
+- Fix interpretation of x86_64 PLT with IRELATIVE slots.
+  (ltrace-0.7.91-x86_64-irelative.patch)
+- Fix fetching of system call arguments on s390.
+  (ltrace-0.7.91-s390-fetch-syscall.patch)
+- Enable tracing of IRELATIVE PLT slots on s390.
+  (ltrace-0.7.91-s390-irelative.patch)
+
+* Thu Nov 21 2013 Petr Machata <pmachata@redhat.com> - 0.7.91-2
+- Fix a problem in including in summary (-c) function calls that don't
+  finish before exec or exit (ltrace-0.7.91-account_execl.patch)
+
 * Tue Nov  5 2013 Petr Machata <pmachata@redhat.com> - 0.7.91-1
 - Rebase to a pre-release 0.8
 - Drop BR on autoconf and friends
