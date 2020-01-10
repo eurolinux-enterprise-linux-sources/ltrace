@@ -1,7 +1,7 @@
 Summary: Tracks runtime library calls from dynamically linked executables
 Name: ltrace
 Version: 0.7.91
-Release: 14%{?dist}
+Release: 11%{?dist}
 URL: http://ltrace.alioth.debian.org/
 License: GPLv2+
 Group: Development/Debuggers
@@ -80,20 +80,6 @@ Patch15: ltrace-0.7.91-parser-ws_after_id.patch
 # http://anonscm.debian.org/cgit/collab-maint/ltrace.git/commit/?id=bf82100966deda9c7d26ad085d97c08126a8ae88
 Patch16: ltrace-0.7.91-ppc-bias.patch
 
-# https://bugzilla.redhat.com/show_bug.cgi?id=1158714
-Patch17: ltrace-0.7.91-x86-plt_map.patch
-Patch18: ltrace-0.7.91-x86-unused_label.patch
-
-# https://bugzilla.redhat.com/show_bug.cgi?id=1210290
-# http://anonscm.debian.org/cgit/collab-maint/ltrace.git/commit/?id=4724bd5a4a19db117a1d280b9d1a3508fd4e03fa
-# http://anonscm.debian.org/cgit/collab-maint/ltrace.git/commit/?id=72ee29639c55b5942bc07c8ed0013005f8fc5a97
-Patch20: ltrace-0.7.91-multithread-no-f-1.patch
-Patch21: ltrace-0.7.91-multithread-no-f-2.patch
-
-# Minor testsuite cleanups for aarch64
-Patch22: ltrace-rh1225550.patch
-Patch23: ltrace-rh1225568.patch
-
 %description
 Ltrace is a debugging program which runs a specified command until the
 command exits.  While the command is executing, ltrace intercepts and
@@ -123,12 +109,6 @@ execution of processes.
 %patch14 -p1
 %patch15 -p1
 %patch16 -p1
-%patch17 -p1
-%patch18 -p1
-%patch20 -p1
-%patch21 -p1
-%patch22 -p1
-%patch23 -p1
 
 %build
 %configure
@@ -153,23 +133,6 @@ echo ====================TESTING END=====================
 %{_datadir}/ltrace
 
 %changelog
-* Mon Jul  20 2015 Jeff Law  - 0.7.91-14
-- Fix dates in ChangeLog.   No functional changes (#1244866)
-
-* Wed Jan  7 2015 Petr Machata <pmachata@redhat.com> - 0.7.91-13
-- Fix system_call_params.exp and system_calls.exp for aarch64.
-  (#1225550)
-- xfail part of trace-irelative.exp for aarch64, fix trace-clone
-  for aarch64 (#1225568)
-
-* Wed Jan  7 2015 Petr Machata <pmachata@redhat.com> - 0.7.91-12
-- Add upstream fix for a bug in labeling PLT slots
-  (ltrace-0.7.91-x86-plt_map.patch,
-  ltrace-0.7.91-x86-unused_label.patch)
-- Add upstream fixes for tracing multi-threaded processes without -f
-  (ltrace-0.7.91-multithread-no-f-1.patch,
-  ltrace-0.7.91-multithread-no-f-2.patch)
-
 * Tue Dec  9 2014 Petr Machata <pmachata@redhat.com> - 0.7.91-11
 - Fix bias handling in PPC backend
 - Fix cloning of unresolved breakpoints in PPC backend
@@ -447,7 +410,7 @@ echo ====================TESTING END=====================
 - e_entry patch: use elf's e_entry field instead of looking up _start
   symbol, which failed on stripped binaries.
 
-* Wed May  3 2006 Petr Machata <pmachata@redhat.com> - 0.4-1.5
+* Tue May  3 2006 Petr Machata <pmachata@redhat.com> - 0.4-1.5
 - Correct a typo that prevented the inclusion of "demangle.h"
 - Adding -Wl,-z,relro
 
@@ -547,7 +510,7 @@ echo ====================TESTING END=====================
 * Sun Jun 24 2001 Elliot Lee <sopwith@redhat.com>
 - Bump release + rebuild.
 
-* Wed Aug  2 2000 Tim Waugh <twaugh@redhat.com>
+* Thu Aug  2 2000 Tim Waugh <twaugh@redhat.com>
 - fix off-by-one problem in checking syscall number
 
 * Wed Jul 12 2000 Prospector <bugzilla@redhat.com>
