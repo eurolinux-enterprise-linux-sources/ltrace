@@ -1,0 +1,286 @@
+diff -Nrup a/testsuite/ltrace.main/system_call_params.exp b/testsuite/ltrace.main/system_call_params.exp
+--- a/testsuite/ltrace.main/system_call_params.exp	2013-10-24 06:02:24.000000000 -0600
++++ b/testsuite/ltrace.main/system_call_params.exp	2015-06-01 12:13:04.639847059 -0600
+@@ -1,5 +1,5 @@
+ # This file is part of ltrace.
+-# Copyright (C) 2013 Petr Machata, Red Hat Inc.
++# Copyright (C) 2013, 2014, 2015 Petr Machata, Red Hat Inc.
+ #
+ # This program is free software; you can redistribute it and/or
+ # modify it under the terms of the GNU General Public License as
+@@ -17,13 +17,31 @@
+ # 02110-1301 USA
+ 
+ set bin [ltraceCompile {} [ltraceSource c {
++    #ifndef _GNU_SOURCE
++    #define _GNU_SOURCE
++    #endif
+     #include <sys/types.h>
+     #include <sys/stat.h>
+     #include <fcntl.h>
++    #include <unistd.h>
++    #include <sys/syscall.h>   /* For SYS_xxx definitions */
++    #include <sys/mount.h>
++
++    #ifndef SYS_open
++    # if defined(__aarch64__)
++    #  /* Linux doesn't actually implement SYS_open on AArch64, but for merely
++    #   * recording the syscall, it's fine.  */
++    #  define SYS_open 1024
++    # else
++    #  error SYS_open not available.
++    # endif
++    #endif
++
+     int main(void) {
+-	open("/some/path", O_RDONLY);
++	syscall(SYS_open, "/some/path", O_RDONLY);
+ 	write(1, "something", 10);
+ 	mount("source", "target", "filesystemtype", 0, 0);
++	return 0;
+     }
+ }]]
+ 
+@@ -42,8 +60,33 @@ set conf [ltraceNamedSource "$dir/syscal
+ # somelib.conf is passed, and syscalls.conf is not available, or
+ # doesn't list readdir, that would be taken from somelib.conf with a
+ # wrong prototype.
++#
++# This test relies on the fact that there is no global config file
++# that would provide legitimate system call prototype.  But that
++# doesn't have to be true, maybe ltrace is already installed on the
++# system with the right prefix.  So first compile a wrapper that we
++# use to redirect fopen calls.
++
++set libfopen_so [ltraceCompile libfopen.so -ldl [ltraceSource c {
++    #define _GNU_SOURCE
++    #include <dlfcn.h>
++    #include <stdio.h>
++    #include <string.h>
++
++    FILE *
++    fopen(const char *path, const char *mode)
++    {
++      if (strncmp(path, "/usr/share", 10) == 0)
++	path = "/dev/null";
++
++      return ((FILE *(*)(const char *, const char *))
++	      dlsym(RTLD_NEXT, "fopen")) (path, mode);
++    }
++}]]
+ 
++setenv LD_PRELOAD $libfopen_so
+ ltraceMatch1 [ltraceRun -L -S -F $conf -- $bin] {^open@SYS\("/some/path"} == 0
++unsetenv LD_PRELOAD
+ 
+ # On the other hand, if -F somedir/ is given, we want to accept
+ # syscalls.conf found there.
+diff -Nrup a/testsuite/ltrace.main/system_calls.exp b/testsuite/ltrace.main/system_calls.exp
+--- a/testsuite/ltrace.main/system_calls.exp	2013-10-24 06:02:24.000000000 -0600
++++ b/testsuite/ltrace.main/system_calls.exp	2015-06-01 12:09:11.132944455 -0600
+@@ -1,67 +1,146 @@
+-# This file was written by Yao Qi <qiyao@cn.ibm.com>.
++# This file is part of ltrace.
++# Copyright (C) 2014 Petr Machata, Red Hat Inc.
++# Copyright (C) 2006 Yao Qi <qiyao@cn.ibm.com>, IBM Corporation
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License as
++# published by the Free Software Foundation; either version 2 of the
++# License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
++# 02110-1301 USA
++
++# Objectives: Verify that Ltrace can trace all the system calls in
++# execution.  Note that this test is necessarily noisy.  Dynamic
++# linker adds a bunch of system calls of its own.
++
++set empty [ltraceCompile {} [ltraceSource c {
++    int main (void) { return 0; }
++}]]
++
++set bin [ltraceCompile {} [ltraceSource c {
++    #include <stdio.h>
++    #include <unistd.h>
++    #include <sys/syscall.h>
++    #include <sys/stat.h>
++    #include <errno.h>
++    #include <stdlib.h>
++
++    int
++    main ()
++    {
++      FILE* fp;
++      char s[]="system_calls";
++      char buffer[1024];
++      struct stat state;
++
++      fp = fopen ("system_calls.tmp", "w");
++      if (fp == NULL)
++	{
++	  printf("Can not create system_calls.tmp\n");
++	  exit (0);
++	}
++      fwrite(s, sizeof(s), 1, fp);
++      fseek (fp, 0, SEEK_CUR);
++      fread(buffer, sizeof(s), 1, fp);
++      fclose(fp);
++
++      getcwd (buffer, sizeof buffer);
++      chdir (".");
++      symlink ("system_calls.tmp", "system_calls.link");
++      remove("system_calls.link");
++      rename ("system_calls.tmp", "system_calls.tmp1");
++      stat ("system_calls.tmp", &state);
++      access ("system_calls.tmp", R_OK);
++      remove("system_calls.tmp1");
++
++      mkdir ("system_call_mkdir", 0777);
++      rmdir ("system_call_mkdir");
++
++      return 0;
++    }
++}]]
++
++proc Calls {logfile} {
++    set fp [open $logfile]
++    set ret {}
++
++    while {[gets $fp line] >= 0} {
++	if [regexp -- {^[a-zA-Z0-9]*@SYS} $line] {
++	    set call [lindex [split $line @] 0]
++	    dict incr ret $call
++	}
++    }
+ 
+-set testfile "system_calls"
+-set srcfile ${testfile}.c
+-set binfile ${testfile}
+-
+-
+-verbose "compiling source file now....."
+-# Build the shared libraries this test case needs.
+-if  { [ ltrace_compile "${srcdir}/${subdir}/${testfile}.c" "${objdir}/${subdir}/${binfile}" executable {debug} ] != "" } {
+-     send_user "Testcase compile failed, so all tests in this file will automatically fail.\n"
++    close $fp
++    return $ret
+ }
+ 
+-# set options for ltrace.
+-ltrace_options "-S"
+-
+-#Run PUT for ltarce.
+-set exec_output [ltrace_runtest $objdir/$subdir $objdir/$subdir/$binfile]
++proc GetDefault {d key def} {
++    if {[dict exists $d $key]} {
++	return [dict get $d $key]
++    } else {
++	return $def
++    }
++}
+ 
+-#check the output of this program.
+-verbose "ltrace runtest output: $exec_output\n"
++proc Diff {d1 d2} {
++    set keys [lsort -unique [concat [dict keys $d1] [dict keys $d2]]]
++    set ret {}
++    foreach key $keys {
++	set n1 [GetDefault $d1 $key 0]
++	set n2 [GetDefault $d2 $key 0]
++	set sum [expr $n1 - $n2]
++	if {[expr $sum != 0]} {
++		dict set ret $key $sum
++	}
++    }
++    return $ret
++}
+ 
+-if [regexp {ELF from incompatible architecture} $exec_output] {
+-	fail "32-bit ltrace can not perform on 64-bit PUTs and rebuild ltrace in 64 bit mode!"
+-        return
+-} elseif [ regexp {Couldn't get .hash data} $exec_output ] {
+-	fail "Couldn't get .hash data!"
+-	return
++proc Match {d patterns} {
++    foreach line $patterns {
++	set pattern [lindex $line 0]
++	set op [lindex $line 1]
++	set expect [lindex $line 2]
++
++	set count 0
++	foreach key [dict keys $d] {
++	    if [regexp -- $pattern $key] {
++		incr count [dict get $d $key]
++	    }
++	}
++
++	set msgMain "$pattern was recorded $count times"
++
++	if {[eval expr $count $op $expect]} {
++	    pass $msgMain
++	} else {
++	    fail "$msgMain, expected $op $expect"
++	}
++    }
+ }
+ 
++Match [Diff [Calls [ltraceRun -L -S -- $bin]] \
++	   [Calls [ltraceRun -L -S -- $empty]]] {
++    { {^write$} == 1 }
++    { {^unlink(at)?$} >= 2 }
++    { {^open(at)?$} == 1 }
++    { {^(new|f)?stat(64)?$} >= 1 }
++    { {^close$} == 1 }
++    { {^getcwd$} == 1 }
++    { {^chdir$} == 1 }
++    { {^symlink(at)?$} == 1 }
++    { {^f?access(at)?$} == 1 }
++    { {^rename(at)?$} == 1 }
++    { {^mkdir(at)?$} == 1 }
++}
+ 
+-set pattern "^munmap@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 2
+-set pattern "^write@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^unlink@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-
+-set pattern "^brk@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^open@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^(new)?fstat(64)?@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1 egrep
+-set pattern "^(old_)?mmap2?@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1 egrep
+-set pattern "^close@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-
+-set pattern "^getcwd@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^chdir@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^symlink@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^unlink@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^(new)?stat(64)?@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1 egrep
+-set pattern "^access@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^rename@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^mkdir@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
+-set pattern "^rmdir@SYS"
+-ltrace_verify_output ${objdir}/${subdir}/${testfile}.ltrace $pattern 1
++ltraceDone
